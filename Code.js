@@ -1006,11 +1006,12 @@ function parseGeminiJsonResponse(responseText, allowedFolders) {
     }
 
     const rawParsed = JSON.parse(rawText);
-    const idx = Number(rawParsed.f);
-    const resolvedFolder = (!isNaN(idx) && idx >= 0 && idx < allowedFolders.length)
-      ? allowedFolders[idx]
-      : "MANUELLE_PRUEFUNG";
-
+const isIdxValid = rawParsed.f !== null && rawParsed.f !== "" && Number.isInteger(Number(rawParsed.f));
+const idx = isIdxValid ? Number(rawParsed.f) : -1;
+const resolvedFolder = (idx >= 0 && idx < allowedFolders.length)
+  ? allowedFolders[idx]
+  : "MANUELLE_PRUEFUNG";
+  
     const usage = json.usageMetadata || {};
     const totalTok = usage.totalTokenCount || 0;
     const promptTok = usage.promptTokenCount || 0;
