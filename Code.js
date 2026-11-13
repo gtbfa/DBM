@@ -52,9 +52,6 @@ function onOpen() {
 
   if (typeof createModelMenu === "function") createModelMenu();
   if (typeof createAccountingMenu === "function") createAccountingMenu();
-  if (typeof setupAccountingSheets === "function") {
-    setupAccountingSheets(SpreadsheetApp.getActiveSpreadsheet());
-  }
 }
 
 function updateLiveStatus(ss, message, title = "🤖 KI-Ablage", seconds = 5, flushNow = true) {
@@ -161,17 +158,26 @@ function fetchGmailAttachments(ss) {
 
       for (let a = 0; a < attachments.length; a++) {
         const att = attachments[a];
-        const mime = (att.getContentType() || "").toLowerCase();
+        const rawMime = (att.getContentType() || "").toLowerCase();
+        const mime = rawMime.split(";")[0].trim();
         const sizeBytes = att.getSize();
+        const rawAttName = att.getName() || "";
+        const lowerAttName = rawAttName.toLowerCase();
+        const isAllowedExt = /\.(pdf|jpe?g|png|webp|heic|txt|csv|docx?|xlsx?)$/i.test(lowerAttName);
 
-        if (!allowedMimeTypes.has(mime)) continue;
+        if (!allowedMimeTypes.has(mime) && !isAllowedExt) continue;
         if (mime.startsWith("image/") && sizeBytes < 5120) continue;
 
         let ext = "";
-        if (mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") ext = ".docx";
-        else if (mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") ext = ".xlsx";
+        if (mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || lowerAttName.endsWith(".docx")) ext = ".docx";
+        else if (mime === "application/msword" || lowerAttName.endsWith(".doc")) ext = ".doc";
+        else if (mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" || lowerAttName.endsWith(".xlsx")) ext = ".xlsx";
+        else if (mime === "application/vnd.ms-excel" || lowerAttName.endsWith(".xls")) ext = ".xls";
+        else if (mime === "application/pdf" || lowerAttName.endsWith(".pdf")) ext = ".pdf";
+        else if (mime === "image/jpeg" || lowerAttName.endsWith(".jpg") || lowerAttName.endsWith(".jpeg")) ext = ".jpg";
+        else if (mime === "image/png" || lowerAttName.endsWith(".png")) ext = ".png";
 
-        const fileName = att.getName() || `Gmail-Anhang_${Utilities.formatDate(msg.getDate(), "Europe/Berlin", "yyyy-MM-dd")}${ext}`;
+        const fileName = rawAttName || `Gmail-Anhang_${Utilities.formatDate(msg.getDate(), "Europe/Berlin", "yyyy-MM-dd")}${ext}`;
         inboxFolder.createFile(att.copyBlob().setName(fileName));
         importedFilesCount++;
         savedInThisThread++;
@@ -274,6 +280,7 @@ function analyzeInboxFiles() {
 
   while (files.hasNext()) {
     const file = files.next();
+    if (file.isTrashed()) continue;
     const existingEntry = existingRowsMap.get(file.getId());
     if (existingEntry && !existingEntry.isError) {
       alreadyListedCount++;
@@ -385,7 +392,15 @@ function analyzeInboxFiles() {
       } else if (folderMap[aiResult.folder_name]) {
         try {
           const targetFolder = DriveApp.getFolderById(folderMap[aiResult.folder_name]);
-          if (targetFolder.getFilesByName(cleanSuggestedName).hasNext()) {
+          const existingMatches = targetFolder.getFilesByName(cleanSuggestedName);
+          let existsInTarget = false;
+          while (existingMatches.hasNext()) {
+            if (!existingMatches.next().isTrashed()) {
+              existsInTarget = true;
+              break;
+            }
+          }
+          if (existsInTarget) {
             isDuplicate = true;
             duplicateCount++;
             statusText = "⚠️ Duplikat";
@@ -403,7 +418,7 @@ function analyzeInboxFiles() {
     }
 
     const rowValues = [
-      `=HYPERLINK("${file.getUrl()}"; "${fileName.replace(/"/g, '""')}")`,
+      `=HYPERLINK("${file.getUrl()}", "${fileName.replace(/"/g, '""')}")`,
       file.getDateCreated(),
       aiResult.folder_name,
       cleanSuggestedName,
@@ -614,7 +629,7 @@ function executeApprovedMoves() {
           if (finalName !== oldFileName) file.setName(finalName);
           file.moveTo(targetFolder);
 
-          const finalLink = `=HYPERLINK("${file.getUrl()}"; "${finalName.replace(/"/g, '""')}")`;
+          const finalLink = `=HYPERLINK("${file.getUrl()}", "${finalName.replace(/"/g, '""')}")`;
           archiveRowsToAdd.push([
             finalLink, originalName, targetFolderName, reasoning, dateCreated, new Date(), fileId, tokens, fileHash
           ]);
@@ -648,7 +663,19 @@ function executeApprovedMoves() {
   }
 
   if (rowsToDelete.length > 0) {
-    for (let r = rowsToDelete.length - 1; r >= 0; r--) sheet.deleteRow(rowsToDelete[r]);
+    rowsToDelete.sort((a, b) => a - b);
+    let end = rowsToDelete[rowsToDelete.length - 1];
+    let count = 1;
+    for (let r = rowsToDelete.length - 2; r >= 0; r--) {
+      if (rowsToDelete[r] === end - count) {
+        count++;
+      } else {
+        sheet.deleteRows(end - count + 1, count);
+        end = rowsToDelete[r];
+        count = 1;
+      }
+    }
+    sheet.deleteRows(end - count + 1, count);
   }
 
   const elapsedSec = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -692,7 +719,13 @@ function getOrCreateArchiveSheet(ss) {
 // ==========================================
 function computeFileHash(file) {
   try {
-    if (file.getSize() / (1024 * 1024) > 25) return "";
+    if (typeof Drive !== "undefined" && Drive.Files) {
+      try {
+        const meta = Drive.Files.get(file.getId(), { fields: "md5Checksum" });
+        if (meta && meta.md5Checksum) return meta.md5Checksum.toLowerCase();
+      } catch (driveErr) {}
+    }
+    if (file.getSize() / (1024 * 1024) > 15) return "";
     const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, file.getBlob().getBytes());
     return digest.map(b => ("0" + ((b < 0 ? b + 256 : b).toString(16))).slice(-2)).join("");
   } catch (e) {
@@ -807,7 +840,8 @@ Regeln:
 function createTempConvertedDriveFile(blob, tempName, targetMimeType, useOcr = false) {
   if (typeof Drive === "undefined" || !Drive.Files) return null;
   if (typeof Drive.Files.create === "function") {
-    return Drive.Files.create({ name: tempName, mimeType: targetMimeType }, blob).id;
+    const options = useOcr ? { ocrLanguage: "de" } : {};
+    return Drive.Files.create({ name: tempName, mimeType: targetMimeType }, blob, options).id;
   }
   if (typeof Drive.Files.insert === "function") {
     const options = useOcr ? { ocr: true, ocrLanguage: "de" } : {};
@@ -1005,13 +1039,14 @@ function parseGeminiJsonResponse(responseText, allowedFolders) {
       };
     }
 
-    const rawParsed = JSON.parse(rawText);
-const isIdxValid = rawParsed.f !== null && rawParsed.f !== "" && Number.isInteger(Number(rawParsed.f));
-const idx = isIdxValid ? Number(rawParsed.f) : -1;
-const resolvedFolder = (idx >= 0 && idx < allowedFolders.length)
-  ? allowedFolders[idx]
-  : "MANUELLE_PRUEFUNG";
-  
+    const cleanedRawText = rawText.replace(/^\s*```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+    const rawParsed = JSON.parse(cleanedRawText);
+    const isIdxValid = rawParsed.f !== null && rawParsed.f !== "" && !isNaN(Number(rawParsed.f));
+    const idx = isIdxValid ? Number(rawParsed.f) : -1;
+    const resolvedFolder = (idx >= 0 && idx < allowedFolders.length)
+      ? allowedFolders[idx]
+      : "MANUELLE_PRUEFUNG";
+
     const usage = json.usageMetadata || {};
     const totalTok = usage.totalTokenCount || 0;
     const promptTok = usage.promptTokenCount || 0;
@@ -1161,10 +1196,8 @@ function executeGeminiCall(payload, allowedFolders, ss, stepInfo, fileName) {
 
     const lowerModel = shortName.toLowerCase();
     let appliedCustomConfig = false;
-    if (lowerModel.includes("flash")) {
-      requestPayload.generationConfig.thinkingConfig = (lowerModel.includes("2.5") || lowerModel.includes("2.0"))
-        ? { thinkingBudget: 0 }
-        : { thinkingLevel: "MINIMAL" };
+    if (lowerModel.includes("2.5") || lowerModel.includes("thinking")) {
+      requestPayload.generationConfig.thinkingConfig = { thinkingBudget: 0 };
       appliedCustomConfig = true;
     }
     if (requestPayload.generationConfig.mediaResolution) appliedCustomConfig = true;
@@ -1238,11 +1271,12 @@ function executeGeminiCall(payload, allowedFolders, ss, stepInfo, fileName) {
 }
 
 function ensureFileExtension(originalName, newName) {
-  let sanitized = newName.replace(/[\/\\:*?"<>|]/g, "-");
+  let sanitized = newName.replace(/[\/\\:*?"<>|]/g, "-").trim();
   const lastDotIndex = originalName.lastIndexOf(".");
   if (lastDotIndex > 0 && (originalName.length - lastDotIndex) <= 6) {
-    const ext = originalName.substring(lastDotIndex);
-    if (!sanitized.toLowerCase().endsWith(ext.toLowerCase())) return sanitized + ext;
+    const ext = originalName.substring(lastDotIndex).toLowerCase();
+    sanitized = sanitized.replace(/\.(pdf|jpe?g|png|webp|heic|txt|csv|docx?|xlsx?)$/i, "");
+    return sanitized + ext;
   }
   return sanitized;
 }

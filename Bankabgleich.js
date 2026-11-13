@@ -211,7 +211,10 @@ function importBankStatementPdfsFromDrive() {
     bankSheet.getRange(startRow, 4, newRowsToAppend.length, 1).setNumberFormat("#,##0.00 €");
   }
 
-  props.setProperty("BANK_PDF_SCANNED_IDS", JSON.stringify([...scannedPdfIds]));
+  try {
+    const safePdfIds = [...scannedPdfIds].slice(-150);
+    props.setProperty("BANK_PDF_SCANNED_IDS", JSON.stringify(safePdfIds));
+  } catch (propErr) {}
 
   if (errorsList.length > 0 && totalAddedRows === 0) {
     SpreadsheetApp.getUi().alert("Kontoauszug konnte nicht ausgelesen werden ⚠️", errorsList.join("\n"), SpreadsheetApp.getUi().ButtonSet.OK);
@@ -310,10 +313,8 @@ Regeln:
     const reqPayload = JSON.parse(JSON.stringify(payload));
 
     let hasThinkingCfg = false;
-    if (shortName.includes("flash")) {
-      reqPayload.generationConfig.thinkingConfig = (shortName.includes("2.5") || shortName.includes("2.0"))
-        ? { thinkingBudget: 0 }
-        : { thinkingLevel: "MINIMAL" };
+    if (shortName.includes("2.5") || shortName.includes("thinking")) {
+      reqPayload.generationConfig.thinkingConfig = { thinkingBudget: 0 };
       hasThinkingCfg = true;
     }
 
@@ -335,7 +336,12 @@ Regeln:
 
       if (res.getResponseCode() === 200) {
         const json = JSON.parse(res.getContentText());
-        const parsed = JSON.parse(json.candidates[0].content.parts[0].text);
+        const rawText = json.candidates && json.candidates[0] && json.candidates[0].content &&
+                        json.candidates[0].content.parts && json.candidates[0].content.parts[0] &&
+                        json.candidates[0].content.parts[0].text;
+        if (!rawText) return { transactions: [], tokens: 0, error: "Leere Antwort von KI" };
+        const cleanText = rawText.replace(/^\s*```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+        const parsed = JSON.parse(cleanText);
         const tokens = json.usageMetadata ? json.usageMetadata.totalTokenCount : 0;
         return { transactions: parsed.transactions || [], tokens: tokens, error: "" };
       }
@@ -361,7 +367,8 @@ function extractFullTextFromPdfViaDrive(file, maxChars) {
     if (typeof Drive.Files.create === "function") {
       tempFileId = Drive.Files.create(
         { name: "Temp_Bank_OCR_" + file.getName(), mimeType: "application/vnd.google-apps.document" },
-        pdfBlob
+        pdfBlob,
+        { ocrLanguage: "de" }
       ).id;
     } else if (typeof Drive.Files.insert === "function") {
       tempFileId = Drive.Files.insert(
@@ -827,6 +834,13 @@ function normalizeVolksbankCsvIfNeeded(bankSheet) {
       bankSheet.getRange(2, 1, cleanRows.length, 1).setNumberFormat("dd.mm.yyyy");
       bankSheet.getRange(2, 4, cleanRows.length, 1).setNumberFormat("#,##0.00 €");
     }
+    bankSheet.setColumnWidth(1, 115);
+    bankSheet.setColumnWidth(2, 220);
+    bankSheet.setColumnWidth(3, 300);
+    bankSheet.setColumnWidth(4, 120);
+    bankSheet.setColumnWidth(5, 210);
+    bankSheet.setColumnWidth(6, 220);
+    bankSheet.setColumnWidth(7, 220);
   }
 }
 

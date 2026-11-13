@@ -172,8 +172,8 @@ function repairAllAccountingSheets() {
   MONTH_SHEET_NAMES.forEach((m, idx) => {
     const r = idx + 2;
     dash.getRange(r, 1).setValue(m);
-    dash.getRange(r, 2).setFormula(`=SUM(${m}!B4:B500)`);
-    dash.getRange(r, 3).setFormula(`=SUM(${m}!C4:C500)`);
+    dash.getRange(r, 2).setFormula(`=SUM('${m}'!B4:B500)`);
+    dash.getRange(r, 3).setFormula(`=SUM('${m}'!C4:C500)`);
     dash.getRange(r, 4).setFormula(`=B${r}-C${r}`);
   });
   dash.getRange(14, 1).setValue("GESAMT").setFontWeight("bold");
@@ -236,8 +236,20 @@ function normalizeDateToIso(val) {
   return "";
 }
 
+function parseAccountingAmount(val) {
+  if (typeof val === "number") return val;
+  if (typeof parseGermanAmount === "function") return parseGermanAmount(val);
+  if (!val) return 0;
+  let str = val.toString().replace(/[€EUR\s]/gi, "").trim();
+  if (str.includes(".") && str.includes(",")) str = str.replace(/\./g, "").replace(",", ".");
+  else if (str.includes(",")) str = str.replace(",", ".");
+  const num = parseFloat(str);
+  return isNaN(num) ? 0 : num;
+}
+
 function bookApprovedInvoice(ss, data) {
-  if (!data || data.type === "Kein Beleg" || data.type === "" || Number(data.amount) <= 0) return;
+  const numAmount = parseAccountingAmount(data ? data.amount : 0);
+  if (!data || data.type === "Kein Beleg" || data.type === "" || numAmount <= 0) return;
 
   const journal = getOrCreateBuchungsjournal(ss);
   const cleanFileId = (data.fileId || "").toString().trim();
@@ -265,7 +277,7 @@ function bookApprovedInvoice(ss, data) {
 
   journal.appendRow([
     monthStr, isoDateStr, data.type, cleanPartner, cleanInvNr,
-    Number(data.amount), data.currency || "EUR", data.category || "Sonstiges",
+    numAmount, data.currency || "EUR", data.category || "Sonstiges",
     data.payStatus || "Offen", data.link || "", isoDueStr, cleanFileId, data.tokens || 0
   ]);
 
@@ -287,7 +299,7 @@ function writeEntryToMonthlySheet(ss, data, monthStr) {
 
   const dateObj = (typeof parseFlexibleDate === "function" ? parseFlexibleDate(data.bDate) : parseIsoDate(data.bDate)) || new Date();
   const dueObj = (typeof parseFlexibleDate === "function" ? parseFlexibleDate(data.dueDate) : parseIsoDate(data.dueDate)) || "";
-  const amount = Number(data.amount) || 0;
+  const amount = parseAccountingAmount(data.amount);
   const isIncome = data.type === "Einnahme";
 
   const descParts = [data.partner];
@@ -296,7 +308,8 @@ function writeEntryToMonthlySheet(ss, data, monthStr) {
   const description = descParts.filter(Boolean).join(" – ");
 
   // Linke Tabelle (Spalten A-E): nächste freie Zeile suchen
-  const scanLimit = Math.max(monthSheet.getLastRow(), 100);
+  const maxAvailableRows = Math.max(1, monthSheet.getMaxRows() - 3);
+  const scanLimit = Math.min(Math.max(monthSheet.getLastRow() - 3, 50), maxAvailableRows);
   const leftValues = monthSheet.getRange(4, 1, scanLimit, 4).getValues();
   let targetLeftRow = 4;
   for (let i = 0; i < leftValues.length; i++) {
@@ -305,6 +318,10 @@ function writeEntryToMonthlySheet(ss, data, monthStr) {
       break;
     }
     targetLeftRow = i + 5;
+  }
+
+  if (targetLeftRow > monthSheet.getMaxRows()) {
+    monthSheet.insertRowsAfter(monthSheet.getMaxRows(), 10);
   }
 
   monthSheet.getRange(targetLeftRow, 1, 1, 4).setValues([[
@@ -331,6 +348,10 @@ function writeEntryToMonthlySheet(ss, data, monthStr) {
         break;
       }
       targetRightRow = i + 5;
+    }
+
+    if (targetRightRow > monthSheet.getMaxRows()) {
+      monthSheet.insertRowsAfter(monthSheet.getMaxRows(), 10);
     }
 
     const isPaid = (data.payStatus || "").toLowerCase() === "bezahlt";
@@ -394,6 +415,16 @@ function scanExistingFoldersForAccounting() {
   const props = PropertiesService.getScriptProperties();
   const scannedRaw = props.getProperty("ACCOUNTING_SCANNED_FILE_IDS");
   const scannedIds = new Set(scannedRaw ? JSON.parse(scannedRaw) : []);
+
+  // Bereits im Buchungsjournal erfasste Datei-IDs laden
+  const journalSheet = ss.getSheetByName("Buchungsjournal");
+  if (journalSheet && journalSheet.getLastRow() > 1) {
+    const jRows = journalSheet.getRange(2, 12, journalSheet.getLastRow() - 1, 1).getValues();
+    jRows.forEach(r => {
+      const id = (r[0] || "").toString().trim();
+      if (id) scannedIds.add(id);
+    });
+  }
 
   const wlData = whitelistSheet.getRange(2, 1, whitelistSheet.getLastRow() - 1, 2).getValues();
   const targetFolders = [];
@@ -489,7 +520,6 @@ function scanExistingFoldersForAccounting() {
     const payload = buildAccountingPayloadForFile(file, folderPath);
     if (!payload) {
       scannedIds.add(fileId);
-      props.setProperty("ACCOUNTING_SCANNED_FILE_IDS", JSON.stringify([...scannedIds]));
       skippedNonInvoices++;
       processedCount++;
       notifyAccountingProgress(ss, `[2/3] "${fileName}" nicht auslesbar – übersprungen.`, stepPrefix, 4);
@@ -518,7 +548,8 @@ function scanExistingFoldersForAccounting() {
         processedCount++;
         continue;
       }
-      extracted = JSON.parse(rawText);
+      const cleanJson = rawText.replace(/^\s*```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+      extracted = JSON.parse(cleanJson);
       usage = json.usageMetadata || {};
     } catch (parseErr) {
       errorCount++;
@@ -531,11 +562,11 @@ function scanExistingFoldersForAccounting() {
 
     totalTokensRun += totalTok;
     scannedIds.add(fileId);
-    props.setProperty("ACCOUNTING_SCANNED_FILE_IDS", JSON.stringify([...scannedIds]));
 
-    if (extracted.t && extracted.t !== "Kein Beleg" && Number(extracted.v) > 0) {
+    const invAmount = parseAccountingAmount(extracted.v);
+    if (extracted.t && extracted.t !== "Kein Beleg" && invAmount > 0) {
       const fallbackDate = Utilities.formatDate(file.getDateCreated(), "Europe/Berlin", "yyyy-MM-dd");
-      const linkFormula = `=HYPERLINK("${file.getUrl()}"; "${fileName.replace(/"/g, '""')}")`;
+      const linkFormula = `=HYPERLINK("${file.getUrl()}", "${fileName.replace(/"/g, '""')}")`;
       bookApprovedInvoice(ss, {
         link: linkFormula,
         type: extracted.t,
@@ -543,7 +574,7 @@ function scanExistingFoldersForAccounting() {
         dueDate: extracted.due || "",
         partner: extracted.p || fileName,
         invNr: extracted.b || "",
-        amount: extracted.v,
+        amount: invAmount,
         currency: extracted.c || "EUR",
         category: extracted.k || "Sonstiges",
         payStatus: extracted.s || "Offen",
@@ -554,7 +585,7 @@ function scanExistingFoldersForAccounting() {
       bookedCount++;
       notifyAccountingProgress(
         ss,
-        `[3/3] Verbucht: ${extracted.t} | ${extracted.p || fileName} | ${Number(extracted.v).toFixed(2)} € (${tokenDisplay})`,
+        `[3/3] Verbucht: ${extracted.t} | ${extracted.p || fileName} | ${invAmount.toFixed(2)} € (${tokenDisplay})`,
         stepPrefix,
         5
       );
@@ -574,6 +605,12 @@ function scanExistingFoldersForAccounting() {
       Utilities.sleep(300);
     }
   }
+
+  // Fortschritt sicher in Properties puffern (max. 150 IDs, um 9-KB-Limit nicht zu verletzen)
+  try {
+    const safeRecentIds = [...scannedIds].slice(-150);
+    props.setProperty("ACCOUNTING_SCANNED_FILE_IDS", JSON.stringify(safeRecentIds));
+  } catch (propErr) {}
 
   const elapsedSec = ((Date.now() - startTime) / 1000).toFixed(1);
   const errInfo = errorCount > 0 ? ` | ❌ ${errorCount} Fehler` : "";
@@ -613,10 +650,8 @@ function sendAccountingRequest(basePayload, models, apiKey, ss, stepInfo, fileNa
 
     const lowerModel = shortName.toLowerCase();
     let appliedCustomConfig = false;
-    if (lowerModel.includes("flash")) {
-      reqPayload.generationConfig.thinkingConfig = (lowerModel.includes("2.5") || lowerModel.includes("2.0"))
-        ? { thinkingBudget: 0 }
-        : { thinkingLevel: "MINIMAL" };
+    if (lowerModel.includes("2.5") || lowerModel.includes("thinking")) {
+      reqPayload.generationConfig.thinkingConfig = { thinkingBudget: 0 };
       appliedCustomConfig = true;
     }
     if (reqPayload.generationConfig.mediaResolution) appliedCustomConfig = true;
@@ -783,8 +818,12 @@ function syncJournalToMonthlySheets() {
     } else {
       monthStr = (r[0] || "").toString().trim();
     }
+    if (!monthStr && r[1]) {
+      const parsedBDate = normalizeDateToIso(r[1]);
+      if (parsedBDate) monthStr = parsedBDate.substring(0, 7);
+    }
 
-    if (!monthStr.startsWith("2026-")) return;
+    if (!monthStr.startsWith(ACCOUNTING_YEAR + "-")) return;
 
     writeEntryToMonthlySheet(ss, {
       bDate: r[1],
