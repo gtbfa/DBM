@@ -50,6 +50,9 @@ function isBankStatementDoc(fileName, reasoning) {
 // MENÜ & LIVE-PROTOKOLLIERUNG (TOAST + LIVE_LOG)
 // ==========================================
 function onOpen() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ensureReviewSheetHeaders(ss);
+
   SpreadsheetApp.getUi()
     .createMenu("🤖 KI-Ablage")
     .addItem("0. Ordner & Unterordner einlesen", "syncSubfolders")
@@ -245,8 +248,42 @@ function escapeHtml(text) {
 
 
 // ==========================================
-// 1. EINZEL-DATEI-ANALYSE FÜR 00_INBOX
+// 1. EINZEL-DATEI-ANALYSE FÜR 00_INBOX (INKL. UNTERORDNER)
 // ==========================================
+function collectInboxFilesRecursive(folder, relativePath, existingRowsMap, filesToProcess, stats, visitedFolderIds) {
+  if (!folder || folder.isTrashed()) return;
+
+  const folderId = folder.getId();
+  if (visitedFolderIds.has(folderId)) return;
+  visitedFolderIds.add(folderId);
+  stats.scannedFolders++;
+
+  const files = folder.getFiles();
+  while (files.hasNext()) {
+    const file = files.next();
+    if (file.isTrashed()) continue;
+
+    const existingEntry = existingRowsMap.get(file.getId());
+    if (existingEntry && !existingEntry.isError) {
+      stats.alreadyListedCount++;
+      continue;
+    }
+    filesToProcess.push({
+      file: file,
+      existingEntry: existingEntry,
+      subFolderPath: relativePath
+    });
+  }
+
+  const subFolders = folder.getFolders();
+  while (subFolders.hasNext()) {
+    const sub = subFolders.next();
+    if (sub.isTrashed()) continue;
+    const nextPath = relativePath ? `${relativePath} / ${sub.getName()}` : sub.getName();
+    collectInboxFilesRecursive(sub, nextPath, existingRowsMap, filesToProcess, stats, visitedFolderIds);
+  }
+}
+
 function analyzeInboxFiles() {
   const startTime = Date.now();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -258,7 +295,7 @@ function analyzeInboxFiles() {
     return;
   }
 
-  updateLiveStatus(ss, "Starte Posteingangs-Prüfung & prüfe Tabellenstruktur...", "🚀 Start", 4);
+  updateLiveStatus(ss, "Starte Posteingangs-Prüfung (inkl. Unterordner) & prüfe Tabellenstruktur...", "🚀 Start", 4);
 
   if (typeof setupAccountingSheets === "function") setupAccountingSheets(ss);
 
@@ -285,34 +322,27 @@ function analyzeInboxFiles() {
   const { existingRowsMap, knownHashes, knownNames } = loadKnownDuplicates(ss, sheet);
 
   const inbox = DriveApp.getFolderById(INBOX_FOLDER_ID);
-  const files = inbox.getFiles();
   const filesToProcess = [];
-  let alreadyListedCount = 0;
+  const scanStats = { alreadyListedCount: 0, scannedFolders: 0 };
 
-  while (files.hasNext()) {
-    const file = files.next();
-    if (file.isTrashed()) continue;
-    const existingEntry = existingRowsMap.get(file.getId());
-    if (existingEntry && !existingEntry.isError) {
-      alreadyListedCount++;
-      continue;
-    }
-    filesToProcess.push({ file, existingEntry });
-  }
+  collectInboxFilesRecursive(inbox, "", existingRowsMap, filesToProcess, scanStats, new Set());
 
   if (filesToProcess.length === 0) {
     updateLiveStatus(
       ss,
-      `Keine neuen Dateien in '00_Inbox' (${alreadyListedCount} Datei(en) warten bereits in 'Prüfung & Freigabe').`,
+      `Keine neuen Dateien in '00_Inbox' und ${Math.max(0, scanStats.scannedFolders - 1)} Unterordner(n) (${scanStats.alreadyListedCount} Datei(en) warten bereits in 'Prüfung & Freigabe').`,
       "Alles aktuell ✓",
       6
     );
     return;
   }
 
+  const subFolderInfo = scanStats.scannedFolders > 1
+    ? ` across ${scanStats.scannedFolders} Ordner(n) inkl. Unterordner`
+    : "";
   updateLiveStatus(
     ss,
-    `${filesToProcess.length} neue Datei(en) in '00_Inbox' gefunden (${allowedFolders.length} Zielordner, ${knownHashes.size} bekannte Hashes geladen).`,
+    `${filesToProcess.length} neue Datei(en)${subFolderInfo} gefunden (${allowedFolders.length} Zielordner, ${knownHashes.size} bekannte Hashes geladen).`,
     "📂 Posteingang bereit",
     5
   );
@@ -335,13 +365,14 @@ function analyzeInboxFiles() {
       break;
     }
 
-    const { file, existingEntry } = filesToProcess[i];
+    const { file, existingEntry, subFolderPath } = filesToProcess[i];
     const fileId = file.getId();
     const fileName = file.getName();
+    const displayLocation = subFolderPath ? `${subFolderPath} / ${fileName}` : fileName;
     const sizeLabel = formatFileSize(file.getSize());
     const stepPrefix = `📄 Datei ${i + 1}/${filesToProcess.length}`;
 
-    updateLiveStatus(ss, `[1/4] Prüfe Fingerabdruck (MD5) für "${fileName}" (${sizeLabel})...`, stepPrefix, 4);
+    updateLiveStatus(ss, `[1/4] Prüfe Fingerabdruck (MD5) für "${displayLocation}" (${sizeLabel})...`, stepPrefix, 4);
 
     const fileHash = computeFileHash(file);
     let isExactDup = false;
@@ -364,8 +395,8 @@ function analyzeInboxFiles() {
         tokenDisplay: "0"
       };
     } else {
-      updateLiveStatus(ss, `[2/4] Lese Dateiinhalt aus "${fileName}" aus (OCR / Text / Vorschau)...`, stepPrefix, 5);
-      const prep = prepareClassificationPayload(file, allowedFolders);
+      updateLiveStatus(ss, `[2/4] Lese Dateiinhalt aus "${displayLocation}" aus (OCR / Text / Vorschau)...`, stepPrefix, 5);
+      const prep = prepareClassificationPayload(file, allowedFolders, subFolderPath);
 
       if (prep && prep.payload) {
         updateLiveStatus(ss, `[3/4] Extraktion fertig (${prep.modeTag}). Sende Anfrage an Gemini KI...`, stepPrefix, 8);
@@ -741,6 +772,34 @@ function getOrCreateArchiveSheet(ss) {
   return archiveSheet;
 }
 
+function ensureReviewSheetHeaders(ss) {
+  const sheet = (ss || SpreadsheetApp.getActiveSpreadsheet()).getSheetByName("Prüfung & Freigabe");
+  if (!sheet) return;
+
+  const extraHeaders = [
+    "Typ (Einnahme/Ausgabe)",
+    "Belegdatum",
+    "Geschäftspartner",
+    "Rechnungs-Nr.",
+    "Brutto-Betrag",
+    "Währung",
+    "Kategorie",
+    "Zahlungsstatus",
+    "Fälligkeitsdatum"
+  ];
+
+  // Spalten L bis T (Spalte 12 bis 20) in Zeile 1 eintragen und optisch an A1:K1 anpassen
+  const targetRange = sheet.getRange(1, 12, 1, extraHeaders.length);
+  targetRange
+    .setValues([extraHeaders])
+    .setFontWeight("bold")
+    .setBackground("#1f4e78")
+    .setFontColor("#ffffff");
+
+  // Spalte P (Brutto-Betrag) als Währung formatieren
+  sheet.getRange("P2:P").setNumberFormat("#,##0.00 €");
+}
+
 
 // ==========================================
 // DOKUMENT-EXTRAKTION & DRIVE-HILFSFUNKTIONEN
@@ -761,7 +820,7 @@ function computeFileHash(file) {
   }
 }
 
-function prepareClassificationPayload(file, allowedFolders) {
+function prepareClassificationPayload(file, allowedFolders, subFolderPath = "") {
   const lowerName = file.getName().toLowerCase();
   const driveMime = (file.getMimeType() || "").toLowerCase();
   const sizeInMB = file.getSize() / (1024 * 1024);
@@ -778,7 +837,7 @@ function prepareClassificationPayload(file, allowedFolders) {
   if (isText) {
     const rawText = file.getBlob().getDataAsString("UTF-8").substring(0, MAX_EXTRACTED_CHARS);
     if (rawText.trim().length > 10) {
-      return buildTextPayload(file, rawText, allowedFolders, `Text (${rawText.trim().length} Zeichen)`);
+      return buildTextPayload(file, rawText, allowedFolders, `Text (${rawText.trim().length} Zeichen)`, subFolderPath);
     }
   }
 
@@ -786,10 +845,10 @@ function prepareClassificationPayload(file, allowedFolders) {
     try {
       const extractedText = extractTextFromOfficeFile(file, isWord);
       if (extractedText && extractedText.trim().length > 15) {
-        return buildTextPayload(file, extractedText, allowedFolders, `Office-Text (${extractedText.length} Zeichen)`);
+        return buildTextPayload(file, extractedText, allowedFolders, `Office-Text (${extractedText.length} Zeichen)`, subFolderPath);
       }
     } catch (officeErr) {}
-    return buildMetadataPayload(file, allowedFolders, "Office-Fehler");
+    return buildMetadataPayload(file, allowedFolders, "Office-Fehler", subFolderPath);
   }
 
   if (isPdf) {
@@ -797,7 +856,7 @@ function prepareClassificationPayload(file, allowedFolders) {
     if (sizeInMB <= 15) {
       const ocrResult = extractTextFromPdfViaDrive(file);
       if (ocrResult.text && ocrResult.text.length >= 40) {
-        return buildTextPayload(file, ocrResult.text, allowedFolders, `PDF-Text (${ocrResult.text.length} Zeichen)`);
+        return buildTextPayload(file, ocrResult.text, allowedFolders, `PDF-Text (${ocrResult.text.length} Zeichen)`, subFolderPath);
       }
       ocrErrorNote = ocrResult.error;
     }
@@ -805,40 +864,42 @@ function prepareClassificationPayload(file, allowedFolders) {
     const previewBlob = getPageOnePreviewImage(file);
     if (previewBlob) {
       const hint = ocrErrorNote ? `Seite-1-Bild (${ocrErrorNote})` : "Seite-1-Bild";
-      return buildInlinePayload(file, allowedFolders, hint, previewBlob, true);
+      return buildInlinePayload(file, allowedFolders, hint, previewBlob, true, subFolderPath);
     }
 
-    return buildMetadataPayload(file, allowedFolders, ocrErrorNote || "PDF ohne Vorschau");
+    return buildMetadataPayload(file, allowedFolders, ocrErrorNote || "PDF ohne Vorschau", subFolderPath);
   }
 
   if (isImage) {
     const resizedBlob = (file.getSize() > 200 * 1024) ? getPageOnePreviewImage(file) : null;
-    return buildInlinePayload(file, allowedFolders, resizedBlob ? "Bild (komprimiert)" : "Bild", resizedBlob, true);
+    return buildInlinePayload(file, allowedFolders, resizedBlob ? "Bild (komprimiert)" : "Bild", resizedBlob, true, subFolderPath);
   }
 
-  return buildMetadataPayload(file, allowedFolders, "Unbekanntes Format");
+  return buildMetadataPayload(file, allowedFolders, "Unbekanntes Format", subFolderPath);
 }
 
-function buildTextPayload(file, extractedText, allowedFolders, modeTag) {
-  const filteredFolders = selectRelevantFolders(allowedFolders, file.getName(), extractedText);
+function buildTextPayload(file, extractedText, allowedFolders, modeTag, subFolderPath = "") {
+  const folderSearchHint = subFolderPath ? `${subFolderPath} ${file.getName()}` : file.getName();
+  const filteredFolders = selectRelevantFolders(allowedFolders, folderSearchHint, extractedText);
   return {
     modeTag: `${modeTag} | ${filteredFolders.length}/${allowedFolders.length} Ordner`,
     payload: {
-      contents: [{ parts: [{ text: buildPrompt(file, filteredFolders) + "\n\nINHALT:\n" + extractedText }] }],
+      contents: [{ parts: [{ text: buildPrompt(file, filteredFolders, subFolderPath) + "\n\nINHALT:\n" + extractedText }] }],
       generationConfig: getJsonConfig(false)
     }
   };
 }
 
-function buildInlinePayload(file, allowedFolders, modeTag, customBlob, useLowMediaRes) {
-  const filteredFolders = selectRelevantFolders(allowedFolders, file.getName(), "");
+function buildInlinePayload(file, allowedFolders, modeTag, customBlob, useLowMediaRes, subFolderPath = "") {
+  const folderSearchHint = subFolderPath ? `${subFolderPath} ${file.getName()}` : file.getName();
+  const filteredFolders = selectRelevantFolders(allowedFolders, folderSearchHint, "");
   const fileBlob = customBlob || file.getBlob();
   return {
     modeTag: `${modeTag} | ${filteredFolders.length}/${allowedFolders.length} Ordner`,
     payload: {
       contents: [{
         parts: [
-          { text: buildPrompt(file, filteredFolders) },
+          { text: buildPrompt(file, filteredFolders, subFolderPath) },
           { inline_data: { mime_type: fileBlob.getContentType(), data: Utilities.base64Encode(fileBlob.getBytes()) } }
         ]
       }],
@@ -847,11 +908,13 @@ function buildInlinePayload(file, allowedFolders, modeTag, customBlob, useLowMed
   };
 }
 
-function buildMetadataPayload(file, allowedFolders, reason) {
-  const filteredFolders = selectRelevantFolders(allowedFolders, file.getName(), "");
+function buildMetadataPayload(file, allowedFolders, reason, subFolderPath = "") {
+  const folderSearchHint = subFolderPath ? `${subFolderPath} ${file.getName()}` : file.getName();
+  const filteredFolders = selectRelevantFolders(allowedFolders, folderSearchHint, "");
   const fallbackDate = Utilities.formatDate(file.getDateCreated(), "Europe/Berlin", "yyyy-MM-dd");
   const compactList = formatIndexedFolders(filteredFolders);
-  const prompt = `Archivierung nur per Dateiname ("${reason}"). Datei: "${file.getName()}" (Datum: ${fallbackDate}).
+  const folderContext = subFolderPath ? `, Inbox-Unterordner: "${subFolderPath}"` : "";
+  const prompt = `Archivierung nur per Dateiname ("${reason}"). Datei: "${file.getName()}" (Datum: ${fallbackDate}${folderContext}).
 Ordner-Index:
 ${compactList}
 Regeln:
@@ -1164,11 +1227,12 @@ function formatIndexedFolders(indexedFolderItems) {
     .join("\n");
 }
 
-function buildPrompt(file, indexedFolderItems) {
+function buildPrompt(file, indexedFolderItems, subFolderPath = "") {
   const fallbackDate = Utilities.formatDate(file.getDateCreated(), "Europe/Berlin", "yyyy-MM-dd");
   const compactList = formatIndexedFolders(indexedFolderItems);
+  const subFolderHint = subFolderPath ? `, Inbox-Unterordner: "${subFolderPath}"` : "";
 
-  let prompt = `Archiviere Dokument (Original: "${file.getName()}", Fallback-Datum: ${fallbackDate}).
+  let prompt = `Archiviere Dokument (Original: "${file.getName()}", Fallback-Datum: ${fallbackDate}${subFolderHint}).
 
 STRIKTE SORTIERREGEL FÜR "01_Finanzen" (UND ALLE UNTERORDNER VON "01_Finanzen"):
 - Ordner unter "01_Finanzen" (inklusive aller Unterordner!) sind AUSSCHLIESSLICH erlaubt für:
