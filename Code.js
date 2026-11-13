@@ -21,7 +21,7 @@ const MAX_RUNTIME_MS = 280000; // Sicherheitsstopp bei ~4 Min. 40 Sek.
 const MAX_EXCEL_ROWS = 35;
 const MAX_EXTRACTED_CHARS = 2000;
 const MAX_IMAGE_DIMENSION = 1024;
-const MAX_MATCHED_FOLDERS = 60;
+const MAX_MATCHED_FOLDERS = 75;
 
 // Namensschema
 const NAMING_CONVENTION = "JJJJ-MM-TT_Absender-oder-Thema_Dokumentart (z. B. 2026-11-12_Telekom_Rechnung)";
@@ -32,6 +32,17 @@ function getApiKey() {
     throw new Error("Kein API-Schlüssel hinterlegt. Bitte 'GEMINI_API_KEY' in den Projekteinstellungen unter Skripteigenschaften eintragen.");
   }
   return key.trim();
+}
+
+function isFinanceFolderPath(folderPath) {
+  if (!folderPath) return false;
+  const normalized = folderPath.toString().trim().replace(/\s*\/\s*/g, "/").toLowerCase();
+  return normalized === "01_finanzen" || normalized.startsWith("01_finanzen/");
+}
+
+function isBankStatementDoc(fileName, reasoning) {
+  const combined = `${fileName || ""} ${reasoning || ""}`.toLowerCase();
+  return ["kontoauszug", "finanzstatus", "umsatzübersicht", "umsatzauskunft"].some(kw => combined.includes(kw));
 }
 
 
@@ -594,11 +605,11 @@ function executeApprovedMoves() {
     const tokens = data[i][9] || 0;
     const fileHash = data[i][10] || "";
 
-    const bType = data[i][11] || "";
+    const bType = (data[i][11] || "").toString().trim();
     const bDate = data[i][12] || "";
     const bPartner = data[i][13] || "";
     const bInvNr = data[i][14] || "";
-    const bAmount = data[i][15] || 0;
+    const bAmount = Number(data[i][15]) || 0;
     const bCurrency = data[i][16] || "";
     const bCategory = data[i][17] || "";
     const bStatus = data[i][18] || "";
@@ -606,8 +617,25 @@ function executeApprovedMoves() {
 
     if (isApproved === true && (status === "Offen" || status === "⚠️ Duplikat")) {
       currentStep++;
-      const targetFolderName = manualOverride !== "" ? manualOverride : aiFolder;
+      const isAiSuggestion = manualOverride === "";
+      const targetFolderName = !isAiSuggestion ? manualOverride : aiFolder;
       const targetFolderId = folderMap[targetFolderName];
+
+      // Schutzsperre: KI darf in "01_Finanzen" NUR eindeutige Rechnungen ODER Kontoauszüge verschieben
+      const isFinanceTarget = isFinanceFolderPath(targetFolderName);
+      const isConfirmedInvoice = (bType === "Einnahme" || bType === "Ausgabe") && bAmount > 0;
+      const isBankStatement = bType === "Kontoauszug" || isBankStatementDoc(`${originalName} ${newNameInput}`, reasoning);
+
+      if (isAiSuggestion && isFinanceTarget && !isConfirmedInvoice && !isBankStatement) {
+        sheet.getRange(i + 1, 8).setValue("Blockiert: Keine Rechnung").setBackground("#fff2cc");
+        updateLiveStatus(
+          ss,
+          `(${currentStep}/${totalToMove}) Blockiert: Weder Rechnung noch Kontoauszug für "${targetFolderName}".`,
+          "🛡️ Sortierschutz",
+          6
+        );
+        continue;
+      }
 
       if (targetFolderId) {
         try {
@@ -634,9 +662,9 @@ function executeApprovedMoves() {
             finalLink, originalName, targetFolderName, reasoning, dateCreated, new Date(), fileId, tokens, fileHash
           ]);
 
-          const isFinanceFolder = targetFolderName.replace(/\s*\/\s*/g, " / ").startsWith("01_Finanzen");
-          if (isFinanceFolder && typeof bookApprovedInvoice === "function" && bType !== "Kein Beleg" && bType !== "") {
-            updateLiveStatus(ss, `Buche Finanzbeleg "${finalName}" ins Buchungsjournal...`, "📊 Buchhaltung", 4, false);
+          // Nur echte Rechnungen ins Buchungsjournal übernehmen (Kontoauszüge werden über Bankabgleich.js eingelesen)
+          if (isFinanceTarget && typeof bookApprovedInvoice === "function" && isConfirmedInvoice && !isBankStatement) {
+            updateLiveStatus(ss, `Buche Rechnungsbeleg "${finalName}" ins Buchungsjournal...`, "📊 Buchhaltung", 4, false);
             bookApprovedInvoice(ss, {
               link: finalLink, type: bType, bDate: bDate, dueDate: bDueDate, partner: bPartner,
               invNr: bInvNr, amount: bAmount, currency: bCurrency,
@@ -827,9 +855,12 @@ function buildMetadataPayload(file, allowedFolders, reason) {
 Ordner-Index:
 ${compactList}
 Regeln:
-- f: Passende Ordner-Nummer (Integer) aus Liste, oder -1 falls unklar.
+- is_rechnung: true NUR wenn der Dateiname eindeutig auf eine Rechnung/Quittung hinweist, sonst false.
+- is_kontoauszug: true NUR wenn es sich um einen Bank-Kontoauszug, Finanzstatus oder Umsatzübersicht handelt, sonst false.
+- f: Passende Ordner-Nummer (Integer) aus Liste, oder -1 falls unklar. WICHTIG: Ordner unter "01_Finanzen" dürfen NUR bei is_rechnung = true ODER is_kontoauszug = true gewählt werden!
+- alt_f: Beste alternative Ordner-Nummer außerhalb von "01_Finanzen" (oder -1).
 - n: Dateiname nach Schema "${NAMING_CONVENTION}".
-- r: Deutsche Begründung (max. 7 Wörter).`;
+- r: Deutsche Begründung (max. 8 Wörter).`;
 
   return {
     modeTag: `Nur-Dateiname: ${reason} | ${filteredFolders.length}/${allowedFolders.length} Ordner`,
@@ -963,10 +994,10 @@ function getPageOnePreviewImage(file) {
 
 
 // ==========================================
-// INTELLIGENTE ORDNER-VORFILTERUNG
+// INTELLIGENTE ORDNER-VORFILTERUNG (MIT SCHUTZ FÜR NICHT-FINANZORDNER)
 // ==========================================
 function selectRelevantFolders(allowedFolders, fileName, extractedText) {
-  if (allowedFolders.length <= 45) {
+  if (allowedFolders.length <= 80) {
     return allowedFolders.map((path, idx) => ({ idx, path }));
   }
 
@@ -1001,20 +1032,26 @@ function selectRelevantFolders(allowedFolders, fileName, extractedText) {
       else if (pw.length >= 5 && stemTokens.has(pw.substring(0, 5))) score += 2;
     });
 
-    return { idx, path, depth, score };
+    return { idx, path, depth, score, isFinance: isFinanceFolderPath(path) };
   });
 
-  const matched = scored
-    .filter(item => item.score > 0)
+  // Getrennte Budgets, damit 01_Finanzen niemals Kunden-/Verwaltungsordner verdrängt
+  const matchedNonFinance = scored
+    .filter(item => !item.isFinance && item.score > 0)
     .sort((a, b) => b.score - a.score || a.depth - b.depth)
-    .slice(0, MAX_MATCHED_FOLDERS);
+    .slice(0, 45);
 
-  const matchedIdxSet = new Set(matched.map(m => m.idx));
-  const topLevel = scored
-    .filter(item => item.depth <= 2 && !matchedIdxSet.has(item.idx))
+  const matchedFinance = scored
+    .filter(item => item.isFinance && item.score > 0)
+    .sort((a, b) => b.score - a.score || a.depth - b.depth)
+    .slice(0, 30);
+
+  const selectedIdxSet = new Set([...matchedNonFinance, ...matchedFinance].map(m => m.idx));
+  const fallbackNonFinance = scored
+    .filter(item => !item.isFinance && !selectedIdxSet.has(item.idx))
     .slice(0, 25);
 
-  const combined = [...matched, ...topLevel];
+  const combined = [...matchedNonFinance, ...matchedFinance, ...fallbackNonFinance];
   combined.sort((a, b) => a.idx - b.idx);
   return combined.map(item => ({ idx: item.idx, path: item.path }));
 }
@@ -1041,11 +1078,48 @@ function parseGeminiJsonResponse(responseText, allowedFolders) {
 
     const cleanedRawText = rawText.replace(/^\s*```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
     const rawParsed = JSON.parse(cleanedRawText);
+
     const isIdxValid = rawParsed.f !== null && rawParsed.f !== "" && !isNaN(Number(rawParsed.f));
     const idx = isIdxValid ? Number(rawParsed.f) : -1;
-    const resolvedFolder = (idx >= 0 && idx < allowedFolders.length)
+    let resolvedFolder = (idx >= 0 && idx < allowedFolders.length)
       ? allowedFolders[idx]
       : "MANUELLE_PRUEFUNG";
+
+    const isAltIdxValid = rawParsed.alt_f !== null && rawParsed.alt_f !== "" && !isNaN(Number(rawParsed.alt_f));
+    const altIdx = isAltIdxValid ? Number(rawParsed.alt_f) : -1;
+    const altFolder = (altIdx >= 0 && altIdx < allowedFolders.length)
+      ? allowedFolders[altIdx]
+      : "MANUELLE_PRUEFUNG";
+
+    // Harte Prüfung: Darf das Dokument in "01_Finanzen" sortiert werden?
+    const hasAccountingFields = typeof rawParsed.t !== "undefined";
+    const isValidInvoiceType = !hasAccountingFields || (rawParsed.t === "Einnahme" || rawParsed.t === "Ausgabe");
+    const hasPositiveAmount = typeof rawParsed.v === "undefined" || Number(rawParsed.v) > 0;
+    const isUnambiguousInvoice = (rawParsed.is_rechnung === true) && isValidInvoiceType && hasPositiveAmount;
+    const isBankStatement = rawParsed.is_kontoauszug === true;
+
+    let reasoningText = rawParsed.r || "";
+    let docType = rawParsed.t || "";
+
+    if (isBankStatement) {
+      // Ausnahme: Kontoauszüge dürfen in "01_Finanzen" (z. B. Volks Bank), werden aber nicht als Einzelrechnung gebucht
+      docType = "Kontoauszug";
+    } else if (!isUnambiguousInvoice) {
+      if (docType === "Einnahme" || docType === "Ausgabe") {
+        docType = "Kein Beleg";
+      }
+
+      if (isFinanceFolderPath(resolvedFolder)) {
+        const blockedTarget = resolvedFolder;
+        if (altFolder !== "MANUELLE_PRUEFUNG" && !isFinanceFolderPath(altFolder)) {
+          resolvedFolder = altFolder;
+          reasoningText = `⚠️ Kein Rechnungsbeleg (${blockedTarget} gesperrt → umgeleitet): ${reasoningText}`;
+        } else {
+          resolvedFolder = "MANUELLE_PRUEFUNG";
+          reasoningText = `⚠️ Kein eindeutiger Rechnungsbeleg (${blockedTarget} gesperrt): ${reasoningText}`;
+        }
+      }
+    }
 
     const usage = json.usageMetadata || {};
     const totalTok = usage.totalTokenCount || 0;
@@ -1060,15 +1134,15 @@ function parseGeminiJsonResponse(responseText, allowedFolders) {
     return {
       folder_name: resolvedFolder,
       suggested_filename: rawParsed.n || "",
-      reasoning: rawParsed.r || "",
+      reasoning: reasoningText,
       tokens: totalTok,
       tokenDisplay: detailStr,
-      t: rawParsed.t,
+      t: docType,
       d: rawParsed.d,
       due: rawParsed.due,
       p: rawParsed.p,
       b: rawParsed.b,
-      v: rawParsed.v,
+      v: isBankStatement ? 0 : rawParsed.v,
       c: rawParsed.c,
       k: rawParsed.k,
       s: rawParsed.s
@@ -1095,12 +1169,24 @@ function buildPrompt(file, indexedFolderItems) {
   const compactList = formatIndexedFolders(indexedFolderItems);
 
   let prompt = `Archiviere Dokument (Original: "${file.getName()}", Fallback-Datum: ${fallbackDate}).
+
+STRIKTE SORTIERREGEL FÜR "01_Finanzen" (UND ALLE UNTERORDNER VON "01_Finanzen"):
+- Ordner unter "01_Finanzen" (inklusive aller Unterordner!) sind AUSSCHLIESSLICH erlaubt für:
+  1. Eindeutige RECHNUNGEN, QUITTUNGEN oder KASSENBONS (mit klarem Rechnungssteller, Empfänger und Rechnungs-Endbetrag > 0).
+  2. AUSNAHME KONTOAUSZÜGE: Bank-Kontoauszüge, Finanzstatus- oder Umsatzübersichten (z. B. Volksbank Kontoauszug) – diese gehören in den entsprechenden Bank-/Volksbank-Ordner unter "01_Finanzen".
+- VERBOTEN für "01_Finanzen" sind alle anderen Dokumente wie z. B.: Kostenvoranschläge, Pflegeverträge, Abtretungserklärungen, reine Leistungsnachweise ohne Rechnungsstellung, Nachweise über Beratungsbesuche (§37 Abs. 3 SGB XI), Lieferscheine, Bestellbestätigungen, Angebote, Mahnungen ohne Rechnungsbeleg oder allgemeine Briefe/Infos.
+- Solche anderen Dokumente dürfen NIEMALS in "01_Finanzen" oder einen Unterordner von "01_Finanzen" sortiert werden! Wähle dafür stattdessen den passenden Kunden-, Kassen-, Auto- oder Organisationsordner (oder -1).
+
 Ordner-Index:
 ${compactList}
-Regeln:
-- f: Passende Ordner-Nummer (Integer, spezifischsten Unterordner wählen, oder -1 falls unklar).
+
+Ausgabe-Regeln:
+- is_rechnung: true NUR wenn es sich eindeutig um eine Rechnung, Quittung oder einen Kassenbon mit Betrag > 0 handelt, sonst zwingend false.
+- is_kontoauszug: true NUR wenn es sich um einen Bank-Kontoauszug, Finanzstatus oder eine Umsatzübersicht handelt, sonst zwingend false.
+- f: Passende Ordner-Nummer (Integer, spezifischsten Unterordner wählen, oder -1 falls unklar). Darf nur bei is_rechnung = true ODER is_kontoauszug = true auf "01_Finanzen" zeigen!
+- alt_f: Beste alternative Ordner-Nummer außerhalb von "01_Finanzen" (oder -1, falls unklar).
 - n: Dateiname nach "${NAMING_CONVENTION}" mit Dokumentendatum (sonst ${fallbackDate}). Ohne / : * ? " < > |.
-- r: Deutsche Begründung (max. 7 Wörter).`;
+- r: Kurze deutsche Begründung (max. 8 Wörter).`;
 
   if (typeof getAccountingPromptExtension === "function") {
     prompt += "\n" + getAccountingPromptExtension(COMPANY_NAME);
@@ -1110,11 +1196,14 @@ Regeln:
 
 function getJsonConfig(useLowMediaRes = false) {
   const props = {
+    is_rechnung: { type: "BOOLEAN" },
+    is_kontoauszug: { type: "BOOLEAN" },
     f: { type: "INTEGER" },
+    alt_f: { type: "INTEGER" },
     n: { type: "STRING" },
     r: { type: "STRING" }
   };
-  const requiredFields = ["f", "n", "r"];
+  const requiredFields = ["is_rechnung", "is_kontoauszug", "f", "alt_f", "n", "r"];
 
   if (typeof getAccountingSchemaExtension === "function") {
     const accProps = getAccountingSchemaExtension();
@@ -1130,7 +1219,7 @@ function getJsonConfig(useLowMediaRes = false) {
       required: requiredFields
     }
   };
-  if (useLowMediaRes) config.mediaResolution = "MEDIA_RESOLUTION_LOW";
+  if (useLowMediaRes) config.mediaResolution = "MEDIA_RESOLUTION_MEDIUM";
   return config;
 }
 
@@ -1197,7 +1286,7 @@ function executeGeminiCall(payload, allowedFolders, ss, stepInfo, fileName) {
     const lowerModel = shortName.toLowerCase();
     let appliedCustomConfig = false;
     if (lowerModel.includes("2.5") || lowerModel.includes("thinking")) {
-      requestPayload.generationConfig.thinkingConfig = { thinkingBudget: 0 };
+      requestPayload.generationConfig.thinkingConfig = { thinkingBudget: 256 };
       appliedCustomConfig = true;
     }
     if (requestPayload.generationConfig.mediaResolution) appliedCustomConfig = true;

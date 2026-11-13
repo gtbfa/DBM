@@ -66,12 +66,12 @@ function getAccountingPromptExtension(companyName) {
 --- BUCHHALTUNG ---
 Firma/Name des Nutzers: "${companyName}"
 Analysiere die Rechnungsdaten (Ignoriere Netto/MwSt, nutze ausschließlich BRUTTO):
-- t: Belegtyp ("Ausgabe", "Einnahme" oder "Kein Beleg"). Rechnungen/Abrechnungen an Kunden oder Pflegekassen sind "Einnahme". Rechnungen/Quittungen an den Nutzer sind "Ausgabe". Kostenvoranschläge, Verträge, Abtretungserklärungen oder Kontoauszüge sind "Kein Beleg".
+- t: Belegtyp ("Ausgabe", "Einnahme" oder "Kein Beleg"). WICHTIG: Nur eindeutige Rechnungen (Ausgangsrechnung an Kunden/Pflegekasse = "Einnahme"; Eingangsrechnung/Quittung/Kassenbon an den Nutzer = "Ausgabe") dürfen gebucht werden. Kostenvoranschläge, Verträge, Abtretungserklärungen, reine Leistungsnachweise ohne Rechnungsbetrag, Beratungsbesuchs-Formulare (§37 Abs. 3 SGB XI), Angebote, Lieferscheine oder Kontoauszüge sind zwingend "Kein Beleg".
 - d: Rechnungs-/Belegdatum im Format JJJJ-MM-DD (falls nicht im Text, nutze das Fallback-Datum).
 - due: Fälligkeitsdatum im Format JJJJ-MM-DD (leer lassen, wenn keins angegeben).
 - p: Geschäftspartner / Kunde (Name der Gegenseite oder des Pflegekunden).
 - b: Rechnungsnummer (leer lassen, wenn keine gefunden).
-- v: Brutto-Endbetrag als Zahl (z.B. 229.00). 0 eintragen, wenn kein Betrag gefunden wird.
+- v: Brutto-Endbetrag als Zahl (z.B. 229.00). 0 eintragen, wenn keine eindeutige Rechnung oder kein Betrag gefunden wird.
 - c: Währung (z.B. EUR).
 - k: Passendste Kategorie aus dieser Liste: ${ACCOUNTING_CATEGORIES.join(", ")}
 - s: Zahlungsstatus ("Bezahlt", "Offen" oder "Unbekannt").
