@@ -418,7 +418,7 @@ function analyzeInboxFiles() {
     }
 
     const rowValues = [
-      `=HYPERLINK("${file.getUrl()}", "${fileName.replace(/"/g, '""')}")`,
+      `=HYPERLINK("${file.getUrl()}"; "${fileName.replace(/"/g, '""')}")`,
       file.getDateCreated(),
       aiResult.folder_name,
       cleanSuggestedName,
@@ -629,7 +629,7 @@ function executeApprovedMoves() {
           if (finalName !== oldFileName) file.setName(finalName);
           file.moveTo(targetFolder);
 
-          const finalLink = `=HYPERLINK("${file.getUrl()}", "${finalName.replace(/"/g, '""')}")`;
+          const finalLink = `=HYPERLINK("${file.getUrl()}"; "${finalName.replace(/"/g, '""')}")`;
           archiveRowsToAdd.push([
             finalLink, originalName, targetFolderName, reasoning, dateCreated, new Date(), fileId, tokens, fileHash
           ]);

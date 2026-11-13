@@ -566,7 +566,7 @@ function scanExistingFoldersForAccounting() {
     const invAmount = parseAccountingAmount(extracted.v);
     if (extracted.t && extracted.t !== "Kein Beleg" && invAmount > 0) {
       const fallbackDate = Utilities.formatDate(file.getDateCreated(), "Europe/Berlin", "yyyy-MM-dd");
-      const linkFormula = `=HYPERLINK("${file.getUrl()}", "${fileName.replace(/"/g, '""')}")`;
+      const linkFormula = `=HYPERLINK("${file.getUrl()}"; "${fileName.replace(/"/g, '""')}")`;
       bookApprovedInvoice(ss, {
         link: linkFormula,
         type: extracted.t,
