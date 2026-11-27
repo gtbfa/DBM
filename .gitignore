@@ -1,2 +1,13 @@
+# Environment files & secrets
+.env
+
+# Local clasp & build/data files
+.clasp.json
+Main.xlsx
+codebase.md
+
+# Dependencies & logs
 node_modules/
+md_export/
+*.log
 .aider*
