@@ -13,7 +13,6 @@ const MAX_RUNTIME_MS = 280000; // Sicherheitsstopp bei ~4 Min. 40 Sek.
 
 // Token-Optimierungs-Limits
 const MAX_EXCEL_ROWS = 35;
-const MAX_EXTRACTED_CHARS = 2000;
 const MAX_IMAGE_DIMENSION = 1024;
 const MAX_MATCHED_FOLDERS = 75;
 
@@ -740,7 +739,7 @@ function prepareClassificationPayload(file, allowedFolders, subFolderPath = "", 
   const isImage = driveMime.startsWith("image/") || /\.(jpg|jpeg|png|webp|heic)$/i.test(lowerName);
 
   if (isText) {
-    const rawText = file.getBlob().getDataAsString("UTF-8").substring(0, MAX_EXTRACTED_CHARS);
+    const rawText = file.getBlob().getDataAsString("UTF-8");
     if (rawText.trim().length > 10) {
       return buildTextPayload(file, rawText, allowedFolders, `Text (${rawText.trim().length} Zeichen)`, subFolderPath, ruleOptions);
     }
@@ -913,7 +912,7 @@ function extractTextFromPdfViaDrive(file) {
     if (!tempFileId) return { text: "", error: "OCR-Konvertierung fehlgeschlagen" };
 
     const rawText = exportGoogleDocAsPlainText(tempFileId);
-    const cleanText = rawText.replace(/\s+/g, " ").trim().substring(0, MAX_EXTRACTED_CHARS);
+    const cleanText = rawText.replace(/\s+/g, " ").trim();
     return { text: cleanText, error: cleanText.length < 40 ? "Kaum Text im PDF" : "" };
   } catch (e) {
     return { text: "", error: "OCR-Fehler" };
@@ -943,7 +942,7 @@ function extractTextFromOfficeFile(file, isWord) {
       for (let i = 0; i < maxRows; i++) lines.push(values[i].join(" | "));
       extractedText = lines.join("\n");
     }
-    return extractedText.replace(/\s+/g, " ").trim().substring(0, MAX_EXTRACTED_CHARS);
+    return extractedText.replace(/\s+/g, " ").trim();
   } finally {
     deleteTempDriveFile(tempFileId);
   }
@@ -1013,14 +1012,11 @@ function selectRelevantFolders(allowedFolders, fileName, extractedText, boostedF
     : `${fileName} ${extractedText || ""}`.toLowerCase();
 
   const rawTokens = normSource.match(/[a-z0-9]{3,}/g) || [];
-
   const exactTokens = new Set();
-  const stemTokens = new Set();
 
   rawTokens.forEach(tok => {
     if (stopWords.has(tok)) return;
     exactTokens.add(tok);
-    if (tok.length >= 5) stemTokens.add(tok.substring(0, 5));
   });
 
   const scored = allowedFolders
@@ -1035,7 +1031,6 @@ function selectRelevantFolders(allowedFolders, fileName, extractedText, boostedF
       pathWords.forEach(pw => {
         if (stopWords.has(pw)) return;
         if (exactTokens.has(pw)) score += 3;
-        else if (pw.length >= 5 && stemTokens.has(pw.substring(0, 5))) score += 2;
       });
 
       return { idx, path, depth, score, isFinance: isFinanceFolderPath(path) };

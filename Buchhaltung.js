@@ -706,7 +706,6 @@ function buildAccountingPayloadForFile(file, folderPath) {
   const driveMime = (file.getMimeType() || "").toLowerCase();
   const blobMime = (file.getBlob().getContentType() || "").toLowerCase();
   const fallbackDate = Utilities.formatDate(file.getDateCreated(), "Europe/Berlin", "yyyy-MM-dd");
-  const maxChars = typeof MAX_EXTRACTED_CHARS !== "undefined" ? MAX_EXTRACTED_CHARS : 2000;
 
   let folderHint = "Hinweis aus Ordnerpfad: Bestimme Einnahme oder Ausgabe anhand des Dokumentinhalts.";
   if (folderPath.includes("Belege Ausgabe") || folderPath.toLowerCase().includes("ausgabe")) {
@@ -746,13 +745,13 @@ ${getAccountingPromptExtension(typeof COMPANY_NAME !== "undefined" ? COMPANY_NAM
         muteHttpExceptions: true
       });
       textContent = res.getResponseCode() === 200
-        ? res.getContentText("UTF-8").replace(/\s+/g, " ").trim().substring(0, maxChars)
-        : DocumentApp.openById(file.getId()).getBody().getText().replace(/\s+/g, " ").trim().substring(0, maxChars);
+        ? res.getContentText("UTF-8").replace(/\s+/g, " ").trim()
+        : DocumentApp.openById(file.getId()).getBody().getText().replace(/\s+/g, " ").trim();
     } catch (e) {}
   } else if (isGoogleSheet) {
     try {
       const vals = SpreadsheetApp.openById(file.getId()).getDataRange().getDisplayValues();
-      textContent = vals.slice(0, 35).map(r => r.join(" | ")).join("\n").replace(/\s+/g, " ").trim().substring(0, maxChars);
+      textContent = vals.slice(0, 35).map(r => r.join(" | ")).join("\n").replace(/\s+/g, " ").trim();
     } catch (e) {}
   } else if ((isWord || isExcel) && typeof extractTextFromOfficeFile === "function") {
     try { textContent = extractTextFromOfficeFile(file, isWord); } catch (e) {}
