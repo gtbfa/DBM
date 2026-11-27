@@ -2,7 +2,7 @@
 // KONFIGURATION
 // ==========================================
 const COMPANY_NAME = "fb-Pflege / Fernanda Bogado";
-const INBOX_FOLDER_ID = "1ytvHfJqTRFvrf78N0VNmpq-ltJuFQtGK";
+const INBOX_FOLDER_ID = "1ekDmimq4LJ41-tAOu3Ls610VAAk28zXq";
 
 // Gmail-Einstellungen
 const GMAIL_LABEL_NAME = "KI-Ablage";
