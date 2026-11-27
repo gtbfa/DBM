@@ -2,7 +2,7 @@
 // KONFIGURATION: GMAIL-IMPORT
 // ==========================================
 const GMAIL_LABEL_NAME = "KI-Ablage";
-const AUTO_FETCH_GMAIL_ON_ANALYZE = true;
+const AUTO_FETCH_GMAIL_ON_ANALYZE = false;
 const SAVE_EMAIL_BODY_AS_PDF = true;
 const MAX_GMAIL_THREADS_PER_RUN = 15;
 

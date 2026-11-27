@@ -38,6 +38,30 @@ function isBankStatementDoc(fileName, reasoning) {
   return ["kontoauszug", "finanzstatus", "umsatzübersicht", "umsatzauskunft"].some(kw => combined.includes(kw));
 }
 
+function normalizeDupKey(rawName) {
+  if (!rawName) return "";
+  const withoutExt = rawName.toString().replace(/\.[a-z0-9]{1,6}$/i, "");
+  if (typeof normalizeRuleText === "function") {
+    return normalizeRuleText(withoutExt).replace(/\s+/g, "_");
+  }
+  return withoutExt
+    .toLowerCase()
+    .replace(/ä/g, "ae")
+    .replace(/ö/g, "oe")
+    .replace(/ü/g, "ue")
+    .replace(/ß/g, "ss")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function buildInvoiceBusinessKey(invNr, amount, bDate) {
+  const cleanInv = (invNr || "").toString().trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+  const numAmt = Number(amount) || 0;
+  if (!cleanInv || cleanInv.length < 3 || numAmt <= 0) return "";
+  const datePart = (bDate || "").toString().trim().substring(0, 10);
+  return `${cleanInv}|${numAmt.toFixed(2)}|${datePart}`;
+}
+
 
 // ==========================================
 // MENÜ & LIVE-PROTOKOLLIERUNG (TOAST + LIVE_LOG)
@@ -246,16 +270,18 @@ function analyzeInboxFiles() {
     if (fileHash && knownHashes.has(fileHash)) {
       const dupMatch = knownHashes.get(fileHash);
       isExactDup = true;
+      const origRef = dupMatch.originalName ? ` (Original: "${dupMatch.originalName}")` : "";
+      const folderRef = dupMatch.folder ? ` in "${dupMatch.folder}"` : "";
       updateLiveStatus(
         ss,
-        `[2/4] Exaktes Duplikat erkannt! Identisch mit "${dupMatch.name}" (${dupMatch.source}) – 0 Tokens verbraucht.`,
+        `[2/4] Exaktes Duplikat erkannt! Identisch mit "${dupMatch.name}"${origRef} (${dupMatch.source}${folderRef}) – 0 Tokens verbraucht.`,
         stepPrefix,
         5
       );
       aiResult = {
         folder_name: dupMatch.folder || "MANUELLE_PRUEFUNG",
         suggested_filename: dupMatch.name || fileName,
-        reasoning: `⚠️ EXAKTES DUPLIKAT (${dupMatch.source}): Identischer Inhalt existiert als "${dupMatch.name}".`,
+        reasoning: `⚠️ EXAKTES DUPLIKAT (${dupMatch.source}${folderRef}): Identischer Inhalt wie "${dupMatch.name}"${origRef}.`,
         tokens: 0,
         tokenDisplay: "0"
       };
@@ -326,15 +352,23 @@ function analyzeInboxFiles() {
     if (isDuplicate) duplicateCount++;
 
     const cleanSuggestedName = ensureFileExtension(fileName, aiResult.suggested_filename || fileName);
+    const normSuggestedKey = normalizeDupKey(cleanSuggestedName);
+    const normOriginalKey = normalizeDupKey(fileName);
 
     if (!isDuplicate && !hasApiError) {
-      const lowerSuggested = cleanSuggestedName.toLowerCase();
-      if (knownNames.has(lowerSuggested)) {
-        const nameMatch = knownNames.get(lowerSuggested);
+      const matchedNameEntry =
+        (normSuggestedKey && knownNames.get(normSuggestedKey)) ||
+        (normOriginalKey && knownNames.get(normOriginalKey));
+
+      if (matchedNameEntry) {
         isDuplicate = true;
         duplicateCount++;
         statusText = "⚠️ Duplikat";
-        aiResult.reasoning = `⚠️ NAMENS-DUPLIKAT (${nameMatch.source}): ${aiResult.reasoning}`;
+        const refName = matchedNameEntry.name || fileName;
+        const refOrig = matchedNameEntry.originalName && matchedNameEntry.originalName !== refName
+          ? ` [Original: "${matchedNameEntry.originalName}"]`
+          : "";
+        aiResult.reasoning = `⚠️ NAMENS-/VERSION-DUPLIKAT (${matchedNameEntry.source} → "${refName}"${refOrig}): ${aiResult.reasoning}`;
       } else if (folderMap[aiResult.folder_name]) {
         try {
           const targetFolder = DriveApp.getFolderById(folderMap[aiResult.folder_name]);
@@ -357,10 +391,28 @@ function analyzeInboxFiles() {
     }
 
     if (fileHash && !knownHashes.has(fileHash)) {
-      knownHashes.set(fileHash, { name: cleanSuggestedName, folder: aiResult.folder_name, source: "Aktueller Lauf" });
+      knownHashes.set(fileHash, {
+        name: cleanSuggestedName,
+        originalName: fileName,
+        folder: aiResult.folder_name,
+        source: "Aktueller Lauf"
+      });
     }
-    if (cleanSuggestedName && !knownNames.has(cleanSuggestedName.toLowerCase())) {
-      knownNames.set(cleanSuggestedName.toLowerCase(), { folder: aiResult.folder_name, source: "Aktueller Lauf" });
+    if (normSuggestedKey && !knownNames.has(normSuggestedKey)) {
+      knownNames.set(normSuggestedKey, {
+        name: cleanSuggestedName,
+        originalName: fileName,
+        folder: aiResult.folder_name,
+        source: "Aktueller Lauf"
+      });
+    }
+    if (normOriginalKey && !knownNames.has(normOriginalKey)) {
+      knownNames.set(normOriginalKey, {
+        name: cleanSuggestedName,
+        originalName: fileName,
+        folder: aiResult.folder_name,
+        source: "Aktueller Lauf"
+      });
     }
 
     const rowValues = [
@@ -442,6 +494,13 @@ function loadWhitelistData(whitelistSheet) {
   return { allowedFolders, folderMap };
 }
 
+function extractPlainLinkLabel(val) {
+  if (!val) return "";
+  const str = val.toString().trim();
+  const m = str.match(/=HYPERLINK\("[^"]*";\s*"([^"]*)"\)/i);
+  return m ? m[1].replace(/""/g, '"') : str;
+}
+
 function loadKnownDuplicates(ss, reviewSheet) {
   const existingRowsMap = new Map();
   const knownHashes = new Map();
@@ -452,6 +511,7 @@ function loadKnownDuplicates(ss, reviewSheet) {
     const maxCol = Math.max(reviewSheet.getLastColumn(), 11);
     const existingData = reviewSheet.getRange(2, 1, lastRow - 1, maxCol).getValues();
     existingData.forEach((row, index) => {
+      const origLabel = extractPlainLinkLabel(row[0]);
       const folderSuggestion = row[2] ? row[2].toString().trim() : "";
       const suggestedName = row[3] ? row[3].toString().trim() : "";
       const existingId = row[8] ? row[8].toString().trim() : "";
@@ -462,8 +522,25 @@ function loadKnownDuplicates(ss, reviewSheet) {
         existingRowsMap.set(existingId, { rowNumber: index + 2, isError });
 
         if (!isError) {
-          if (existingHash) knownHashes.set(existingHash, { name: suggestedName, folder: folderSuggestion, source: "Prüfliste" });
-          if (suggestedName) knownNames.set(suggestedName.toLowerCase(), { folder: folderSuggestion, source: "Prüfliste" });
+          if (existingHash && !knownHashes.has(existingHash)) {
+            knownHashes.set(existingHash, {
+              name: suggestedName || origLabel,
+              originalName: origLabel,
+              folder: folderSuggestion,
+              source: "Prüfliste"
+            });
+          }
+          [suggestedName, origLabel].forEach(rawCandidate => {
+            const normKey = normalizeDupKey(rawCandidate);
+            if (normKey && !knownNames.has(normKey)) {
+              knownNames.set(normKey, {
+                name: suggestedName || origLabel,
+                originalName: origLabel,
+                folder: folderSuggestion,
+                source: "Prüfliste"
+              });
+            }
+          });
         }
       }
     });
@@ -474,16 +551,30 @@ function loadKnownDuplicates(ss, reviewSheet) {
     const archCols = archiveSheet.getLastColumn();
     const archData = archiveSheet.getRange(2, 1, archiveSheet.getLastRow() - 1, archCols).getValues();
     archData.forEach(row => {
-      const archNewName = row[0] ? row[0].toString().trim() : "";
+      const archNewName = extractPlainLinkLabel(row[0]);
+      const archOrigName = extractPlainLinkLabel(row[1]);
       const archFolder = row[2] ? row[2].toString().trim() : "";
       const archHash = (archCols >= 9 && row[8]) ? row[8].toString().trim() : "";
 
       if (archHash && !knownHashes.has(archHash)) {
-        knownHashes.set(archHash, { name: archNewName, folder: archFolder, source: "Archiv" });
+        knownHashes.set(archHash, {
+          name: archNewName || archOrigName,
+          originalName: archOrigName,
+          folder: archFolder,
+          source: "Archiv"
+        });
       }
-      if (archNewName && !knownNames.has(archNewName.toLowerCase())) {
-        knownNames.set(archNewName.toLowerCase(), { folder: archFolder, source: "Archiv" });
-      }
+      [archNewName, archOrigName].forEach(rawCandidate => {
+        const normKey = normalizeDupKey(rawCandidate);
+        if (normKey && !knownNames.has(normKey)) {
+          knownNames.set(normKey, {
+            name: archNewName || archOrigName,
+            originalName: archOrigName,
+            folder: archFolder,
+            source: "Archiv"
+          });
+        }
+      });
     });
   }
 
@@ -526,6 +617,7 @@ function executeApprovedMoves() {
   let currentStep = 0;
   const rowsToDelete = [];
   const archiveRowsToAdd = [];
+  const bookedBusinessKeys = new Set();
 
   for (let i = 1; i < data.length; i++) {
     const originalName = data[i][0];
@@ -598,13 +690,31 @@ function executeApprovedMoves() {
           ]);
 
           // Nur echte Rechnungen ins Buchungsjournal übernehmen (Kontoauszüge werden über Bankabgleich.js eingelesen)
-          if (isFinanceTarget && typeof bookApprovedInvoice === "function" && isConfirmedInvoice && !isBankStatement) {
+          const bizKey = buildInvoiceBusinessKey(bInvNr, bAmount, bDate);
+          const alreadyBookedInRun = bizKey ? bookedBusinessKeys.has(bizKey) : false;
+
+          if (
+            isFinanceTarget &&
+            typeof bookApprovedInvoice === "function" &&
+            isConfirmedInvoice &&
+            !isBankStatement &&
+            !alreadyBookedInRun
+          ) {
+            if (bizKey) bookedBusinessKeys.add(bizKey);
             updateLiveStatus(ss, `Buche Rechnungsbeleg "${finalName}" ins Buchungsjournal...`, "📊 Buchhaltung", 4, false);
             bookApprovedInvoice(ss, {
               link: finalLink, type: bType, bDate: bDate, dueDate: bDueDate, partner: bPartner,
               invNr: bInvNr, amount: bAmount, currency: bCurrency,
               category: bCategory, payStatus: bStatus, fileId: fileId, tokens: tokens
             });
+          } else if (isFinanceTarget && isConfirmedInvoice && !isBankStatement && alreadyBookedInRun) {
+            updateLiveStatus(
+              ss,
+              `Doppelbuchung verhindert für "${finalName}" (Geschäftsschlüssel ${bizKey} bereits gebucht).`,
+              "📊 Buchhaltung",
+              4,
+              false
+            );
           }
 
           rowsToDelete.push(i + 1);

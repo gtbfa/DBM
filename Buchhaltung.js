@@ -255,22 +255,43 @@ function bookApprovedInvoice(ss, data) {
   const cleanFileId = (data.fileId || "").toString().trim();
   const cleanInvNr = (data.invNr || "").toString().trim();
   const cleanPartner = (data.partner || "").toString().trim();
+  const isoDateStr = normalizeDateToIso(data.bDate) || Utilities.formatDate(new Date(), "Europe/Berlin", "yyyy-MM-dd");
+  const isoDueStr = normalizeDateToIso(data.dueDate);
+  const monthStr = isoDateStr.substring(0, 7);
+  const incomingBizKey = typeof buildInvoiceBusinessKey === "function"
+    ? buildInvoiceBusinessKey(cleanInvNr, numAmount, isoDateStr)
+    : "";
+  const normCleanInv = cleanInvNr.toLowerCase().replace(/[^a-z0-9]/g, "");
 
   if (journal.getLastRow() > 1) {
     const jCols = Math.max(journal.getLastColumn(), 12);
     const jData = journal.getRange(2, 1, journal.getLastRow() - 1, jCols).getValues();
     for (let r = 0; r < jData.length; r++) {
-      const existingFileId = (jData[r][11] || "").toString().trim();
-      const existingInvNr = (jData[r][4] || "").toString().trim();
+      const existingDate = normalizeDateToIso(jData[r][1]);
       const existingPartner = (jData[r][3] || "").toString().trim();
+      const existingInvNr = (jData[r][4] || "").toString().trim();
+      const existingAmount = parseAccountingAmount(jData[r][5]);
+      const existingFileId = (jData[r][11] || "").toString().trim();
+
       if (cleanFileId && existingFileId === cleanFileId) return;
+
+      const existingBizKey = typeof buildInvoiceBusinessKey === "function"
+        ? buildInvoiceBusinessKey(existingInvNr, existingAmount, existingDate)
+        : "";
+      if (incomingBizKey && existingBizKey === incomingBizKey) return;
+
+      const normExistingInv = existingInvNr.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (
+        normCleanInv.length >= 3 &&
+        normExistingInv === normCleanInv &&
+        Math.abs(existingAmount - numAmount) <= 0.02
+      ) {
+        return;
+      }
+
       if (cleanInvNr && cleanInvNr.length >= 4 && existingInvNr === cleanInvNr && existingPartner === cleanPartner) return;
     }
   }
-
-  const isoDateStr = normalizeDateToIso(data.bDate) || Utilities.formatDate(new Date(), "Europe/Berlin", "yyyy-MM-dd");
-  const isoDueStr = normalizeDateToIso(data.dueDate);
-  const monthStr = isoDateStr.substring(0, 7);
 
   data.bDate = isoDateStr;
   data.dueDate = isoDueStr;
