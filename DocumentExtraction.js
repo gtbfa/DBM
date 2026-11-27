@@ -17,7 +17,7 @@ function computeFileHash(file) {
   }
 }
 
-function prepareClassificationPayload(file, allowedFolders, subFolderPath = "") {
+function prepareClassificationPayload(file, allowedFolders, subFolderPath = "", ruleOptions = {}) {
   const lowerName = file.getName().toLowerCase();
   const driveMime = (file.getMimeType() || "").toLowerCase();
   const sizeInMB = file.getSize() / (1024 * 1024);
@@ -32,9 +32,9 @@ function prepareClassificationPayload(file, allowedFolders, subFolderPath = "") 
   const isImage = driveMime.startsWith("image/") || /\.(jpg|jpeg|png|webp|heic)$/i.test(lowerName);
 
   if (isText) {
-    const rawText = file.getBlob().getDataAsString("UTF-8").substring(0, MAX_EXTRACTED_CHARS);
+    const rawText = file.getBlob().getDataAsString("UTF-8");
     if (rawText.trim().length > 10) {
-      return buildTextPayload(file, rawText, allowedFolders, `Text (${rawText.trim().length} Zeichen)`, subFolderPath);
+      return buildTextPayload(file, rawText, allowedFolders, `Text (${rawText.trim().length} Zeichen)`, subFolderPath, ruleOptions);
     }
   }
 
@@ -42,10 +42,10 @@ function prepareClassificationPayload(file, allowedFolders, subFolderPath = "") 
     try {
       const extractedText = extractTextFromOfficeFile(file, isWord);
       if (extractedText && extractedText.trim().length > 15) {
-        return buildTextPayload(file, extractedText, allowedFolders, `Office-Text (${extractedText.length} Zeichen)`, subFolderPath);
+        return buildTextPayload(file, extractedText, allowedFolders, `Office-Text (${extractedText.length} Zeichen)`, subFolderPath, ruleOptions);
       }
     } catch (officeErr) {}
-    return buildMetadataPayload(file, allowedFolders, "Office-Fehler", subFolderPath);
+    return buildMetadataPayload(file, allowedFolders, "Office-Fehler", subFolderPath, ruleOptions);
   }
 
   if (isPdf) {
@@ -53,7 +53,7 @@ function prepareClassificationPayload(file, allowedFolders, subFolderPath = "") 
     if (sizeInMB <= 15) {
       const ocrResult = extractTextFromPdfViaDrive(file);
       if (ocrResult.text && ocrResult.text.length >= 40) {
-        return buildTextPayload(file, ocrResult.text, allowedFolders, `PDF-Text (${ocrResult.text.length} Zeichen)`, subFolderPath);
+        return buildTextPayload(file, ocrResult.text, allowedFolders, `PDF-Text (${ocrResult.text.length} Zeichen)`, subFolderPath, ruleOptions);
       }
       ocrErrorNote = ocrResult.error;
     }
@@ -61,42 +61,58 @@ function prepareClassificationPayload(file, allowedFolders, subFolderPath = "") 
     const previewBlob = getPageOnePreviewImage(file);
     if (previewBlob) {
       const hint = ocrErrorNote ? `Seite-1-Bild (${ocrErrorNote})` : "Seite-1-Bild";
-      return buildInlinePayload(file, allowedFolders, hint, previewBlob, true, subFolderPath);
+      return buildInlinePayload(file, allowedFolders, hint, previewBlob, true, subFolderPath, ruleOptions);
     }
 
-    return buildMetadataPayload(file, allowedFolders, ocrErrorNote || "PDF ohne Vorschau", subFolderPath);
+    return buildMetadataPayload(file, allowedFolders, ocrErrorNote || "PDF ohne Vorschau", subFolderPath, ruleOptions);
   }
 
   if (isImage) {
     const resizedBlob = (file.getSize() > 200 * 1024) ? getPageOnePreviewImage(file) : null;
-    return buildInlinePayload(file, allowedFolders, resizedBlob ? "Bild (komprimiert)" : "Bild", resizedBlob, true, subFolderPath);
+    return buildInlinePayload(file, allowedFolders, resizedBlob ? "Bild (komprimiert)" : "Bild", resizedBlob, true, subFolderPath, ruleOptions);
   }
 
-  return buildMetadataPayload(file, allowedFolders, "Unbekanntes Format", subFolderPath);
+  return buildMetadataPayload(file, allowedFolders, "Unbekanntes Format", subFolderPath, ruleOptions);
 }
 
-function buildTextPayload(file, extractedText, allowedFolders, modeTag, subFolderPath = "") {
+function buildTextPayload(file, extractedText, allowedFolders, modeTag, subFolderPath = "", ruleOptions = {}) {
   const folderSearchHint = subFolderPath ? `${subFolderPath} ${file.getName()}` : file.getName();
-  const filteredFolders = selectRelevantFolders(allowedFolders, folderSearchHint, extractedText);
+  const filteredFolders = selectRelevantFolders(
+    allowedFolders,
+    folderSearchHint,
+    extractedText,
+    ruleOptions.boostedFolders || [],
+    Boolean(ruleOptions.isInvoiceCandidate)
+  );
   return {
     modeTag: `${modeTag} | ${filteredFolders.length}/${allowedFolders.length} Ordner`,
     payload: {
-      contents: [{ parts: [{ text: buildPrompt(file, filteredFolders, subFolderPath) + "\n\nINHALT:\n" + extractedText }] }],
+      contents: [{
+        parts: [{
+          text: buildPrompt(file, filteredFolders, subFolderPath, ruleOptions.promptHint || "") + "\n\nINHALT:\n" + extractedText
+        }]
+      }],
       generationConfig: getJsonConfig(false)
     }
   };
 }
 
-function buildInlinePayload(file, allowedFolders, modeTag, customBlob, useLowMediaRes, subFolderPath = "") {
+function buildInlinePayload(file, allowedFolders, modeTag, customBlob, useLowMediaRes, subFolderPath = "", ruleOptions = {}) {
   const folderSearchHint = subFolderPath ? `${subFolderPath} ${file.getName()}` : file.getName();
-  const filteredFolders = selectRelevantFolders(allowedFolders, folderSearchHint, "");
+  const filteredFolders = selectRelevantFolders(
+    allowedFolders,
+    folderSearchHint,
+    "",
+    ruleOptions.boostedFolders || [],
+    Boolean(ruleOptions.isInvoiceCandidate)
+  );
   const fileBlob = customBlob || file.getBlob();
   return {
     modeTag: `${modeTag} | ${filteredFolders.length}/${allowedFolders.length} Ordner`,
     payload: {
       contents: [{
         parts: [
-          { text: buildPrompt(file, filteredFolders, subFolderPath) },
+          { text: buildPrompt(file, filteredFolders, subFolderPath, ruleOptions.promptHint || "") },
           { inline_data: { mime_type: fileBlob.getContentType(), data: Utilities.base64Encode(fileBlob.getBytes()) } }
         ]
       }],
@@ -105,19 +121,26 @@ function buildInlinePayload(file, allowedFolders, modeTag, customBlob, useLowMed
   };
 }
 
-function buildMetadataPayload(file, allowedFolders, reason, subFolderPath = "") {
+function buildMetadataPayload(file, allowedFolders, reason, subFolderPath = "", ruleOptions = {}) {
   const folderSearchHint = subFolderPath ? `${subFolderPath} ${file.getName()}` : file.getName();
-  const filteredFolders = selectRelevantFolders(allowedFolders, folderSearchHint, "");
+  const filteredFolders = selectRelevantFolders(
+    allowedFolders,
+    folderSearchHint,
+    "",
+    ruleOptions.boostedFolders || [],
+    Boolean(ruleOptions.isInvoiceCandidate)
+  );
   const fallbackDate = Utilities.formatDate(file.getDateCreated(), "Europe/Berlin", "yyyy-MM-dd");
   const compactList = formatIndexedFolders(filteredFolders);
   const folderContext = subFolderPath ? `, Inbox-Unterordner: "${subFolderPath}"` : "";
-  const prompt = `Archivierung nur per Dateiname ("${reason}"). Datei: "${file.getName()}" (Datum: ${fallbackDate}${folderContext}).
+  const ruleLine = ruleOptions.promptHint ? `\n${ruleOptions.promptHint}` : "";
+  const prompt = `Archivierung nur per Dateiname ("${reason}"). Datei: "${file.getName()}" (Datum: ${fallbackDate}${folderContext}).${ruleLine}
 Ordner-Index:
 ${compactList}
 Regeln:
-- is_rechnung: true NUR wenn der Dateiname eindeutig auf eine Rechnung/Quittung hinweist, sonst false.
+- is_rechnung: true NUR wenn der Dateiname eindeutig auf eine Rechnung/Quittung/Gutschrift hinweist (Dokumente mit "Abrechnung" sind KEINE Rechnungen, sofern nicht explizit als Rechnung/Quittung/Gutschrift ausgewiesen), sonst false.
 - is_kontoauszug: true NUR wenn es sich um einen Bank-Kontoauszug, Finanzstatus oder eine Umsatzübersicht handelt, sonst false.
-- f: Passende Ordner-Nummer (Integer) aus Liste, oder -1 falls unklar. WICHTIG: Ordner unter "01_Finanzen" dürfen NUR bei is_rechnung = true ODER is_kontoauszug = true gewählt werden!
+- f: Passende Ordner-Nummer (Integer) aus Liste, oder -1 falls unklar. WICHTIG: Ordner unter "01_Finanzen" dürfen NUR bei is_rechnung = true ODER is_kontoauszug = true gewählt werden! Dokumente mit "Abrechnung" gehören in einen passenden Ordner AUSSERHALB von "01_Finanzen".
 - alt_f: Beste alternative Ordner-Nummer außerhalb von "01_Finanzen" (oder -1).
 - n: Dateiname nach Schema "${NAMING_CONVENTION}".
 - r: Deutsche Begründung (max. 8 Wörter).`;
@@ -185,7 +208,7 @@ function extractTextFromPdfViaDrive(file) {
     if (!tempFileId) return { text: "", error: "OCR-Konvertierung fehlgeschlagen" };
 
     const rawText = exportGoogleDocAsPlainText(tempFileId);
-    const cleanText = rawText.replace(/\s+/g, " ").trim().substring(0, MAX_EXTRACTED_CHARS);
+    const cleanText = rawText.replace(/\s+/g, " ").trim();
     return { text: cleanText, error: cleanText.length < 40 ? "Kaum Text im PDF" : "" };
   } catch (e) {
     return { text: "", error: "OCR-Fehler" };
@@ -215,7 +238,7 @@ function extractTextFromOfficeFile(file, isWord) {
       for (let i = 0; i < maxRows; i++) lines.push(values[i].join(" | "));
       extractedText = lines.join("\n");
     }
-    return extractedText.replace(/\s+/g, " ").trim().substring(0, MAX_EXTRACTED_CHARS);
+    return extractedText.replace(/\s+/g, " ").trim();
   } finally {
     deleteTempDriveFile(tempFileId);
   }

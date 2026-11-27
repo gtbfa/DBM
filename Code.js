@@ -14,7 +14,6 @@ const MAX_RUNTIME_MS = 280000; // Sicherheitsstopp bei ~4 Min. 40 Sek.
 // Token-Optimierungs-Limits
 const MAX_EXCEL_ROWS = 35;
 const MAX_IMAGE_DIMENSION = 1024;
-const MAX_MATCHED_FOLDERS = 75;
 
 // Namensschema
 const NAMING_CONVENTION = "JJJJ-MM-TT_Absender-oder-Thema_Dokumentart (z. B. 2026-11-12_Telekom_Rechnung)";
@@ -25,17 +24,6 @@ function getApiKey() {
     throw new Error("Kein API-Schlüssel hinterlegt. Bitte 'GEMINI_API_KEY' in den Projekteinstellungen unter Skripteigenschaften eintragen.");
   }
   return key.trim();
-}
-
-function isFinanceFolderPath(folderPath) {
-  if (!folderPath) return false;
-  const normalized = folderPath.toString().trim().replace(/\s*\/\s*/g, "/").toLowerCase();
-  return normalized === "01_finanzen" || normalized.startsWith("01_finanzen/");
-}
-
-function isBankStatementDoc(fileName, reasoning) {
-  const combined = `${fileName || ""} ${reasoning || ""}`.toLowerCase();
-  return ["kontoauszug", "finanzstatus", "umsatzübersicht", "umsatzauskunft"].some(kw => combined.includes(kw));
 }
 
 function normalizeDupKey(rawName) {
@@ -289,12 +277,14 @@ function analyzeInboxFiles() {
       let ruleEval = {
         mode: "FALLBACK_LLM",
         boostedFolders: [],
-        promptHint: ""
+        promptHint: "",
+        isInvoiceCandidate: false
       };
 
       if (typeof buildSortingContext === "function" && typeof evaluateSortingRules === "function") {
         const ctx = buildSortingContext(file, "", subFolderPath, folderMap, "");
         ruleEval = evaluateSortingRules(ctx, folderMap);
+        ruleEval.isInvoiceCandidate = Boolean(ctx.isInvoiceCandidate);
       }
 
       if (ruleEval.mode === "HARD_ROUTE" && ruleEval.folder_name) {
@@ -324,7 +314,8 @@ function analyzeInboxFiles() {
         updateLiveStatus(ss, `[2/4] Lese Dateiinhalt aus "${displayLocation}" aus (OCR / Text / Vorschau)...`, stepPrefix, 5);
         const prep = prepareClassificationPayload(file, allowedFolders, subFolderPath, {
           boostedFolders: ruleEval.boostedFolders || [],
-          promptHint: ruleEval.promptHint || ""
+          promptHint: ruleEval.promptHint || "",
+          isInvoiceCandidate: ruleEval.isInvoiceCandidate
         });
 
         if (prep && prep.payload) {
@@ -648,12 +639,11 @@ function executeApprovedMoves() {
       const targetFolderName = !isAiSuggestion ? manualOverride : aiFolder;
       const targetFolderId = folderMap[targetFolderName];
 
-      // Schutzsperre: KI darf in "01_Finanzen" NUR eindeutige Rechnungen ODER Kontoauszüge verschieben
-      const isFinanceTarget = isFinanceFolderPath(targetFolderName);
-      const isConfirmedInvoice = (bType === "Einnahme" || bType === "Ausgabe") && bAmount > 0;
-      const isBankStatement = bType === "Kontoauszug" || isBankStatementDoc(`${originalName} ${newNameInput}`, reasoning);
+      const financeGate = typeof canMoveToFinanceFolder === "function"
+        ? canMoveToFinanceFolder(targetFolderName, isAiSuggestion, bType, bAmount, originalName, newNameInput, reasoning)
+        : { allowed: true, isFinanceTarget: false, isConfirmedInvoice: false, isBankStatement: false };
 
-      if (isAiSuggestion && isFinanceTarget && !isConfirmedInvoice && !isBankStatement) {
+      if (!financeGate.allowed) {
         sheet.getRange(i + 1, 8).setValue("Blockiert: Keine Rechnung").setBackground("#fff2cc");
         updateLiveStatus(
           ss,
@@ -689,15 +679,14 @@ function executeApprovedMoves() {
             finalLink, originalName, targetFolderName, reasoning, dateCreated, new Date(), fileId, tokens, fileHash
           ]);
 
-          // Nur echte Rechnungen ins Buchungsjournal übernehmen (Kontoauszüge werden über Bankabgleich.js eingelesen)
           const bizKey = buildInvoiceBusinessKey(bInvNr, bAmount, bDate);
           const alreadyBookedInRun = bizKey ? bookedBusinessKeys.has(bizKey) : false;
 
           if (
-            isFinanceTarget &&
+            financeGate.isFinanceTarget &&
             typeof bookApprovedInvoice === "function" &&
-            isConfirmedInvoice &&
-            !isBankStatement &&
+            financeGate.isConfirmedInvoice &&
+            !financeGate.isBankStatement &&
             !alreadyBookedInRun
           ) {
             if (bizKey) bookedBusinessKeys.add(bizKey);
@@ -707,7 +696,7 @@ function executeApprovedMoves() {
               invNr: bInvNr, amount: bAmount, currency: bCurrency,
               category: bCategory, payStatus: bStatus, fileId: fileId, tokens: tokens
             });
-          } else if (isFinanceTarget && isConfirmedInvoice && !isBankStatement && alreadyBookedInRun) {
+          } else if (financeGate.isFinanceTarget && financeGate.isConfirmedInvoice && !financeGate.isBankStatement && alreadyBookedInRun) {
             updateLiveStatus(
               ss,
               `Doppelbuchung verhindert für "${finalName}" (Geschäftsschlüssel ${bizKey} bereits gebucht).`,
@@ -802,7 +791,6 @@ function ensureReviewSheetHeaders(ss) {
     "Fälligkeitsdatum"
   ];
 
-  // Spalten L bis T (Spalte 12 bis 20) in Zeile 1 eintragen und optisch an A1:K1 anpassen
   const targetRange = sheet.getRange(1, 12, 1, extraHeaders.length);
   targetRange
     .setValues([extraHeaders])
@@ -810,372 +798,15 @@ function ensureReviewSheetHeaders(ss) {
     .setBackground("#1f4e78")
     .setFontColor("#ffffff");
 
-  // Spalte P (Brutto-Betrag) als Währung formatieren
   sheet.getRange("P2:P").setNumberFormat("#,##0.00 €");
 }
 
 
 // ==========================================
-// DOKUMENT-EXTRAKTION & DRIVE-HILFSFUNKTIONEN
+// ALLE ORDNER EINBEZIEHEN (OHNE MAX-BEGRENZUNG)
 // ==========================================
-function computeFileHash(file) {
-  try {
-    if (typeof Drive !== "undefined" && Drive.Files) {
-      try {
-        const meta = Drive.Files.get(file.getId(), { fields: "md5Checksum" });
-        if (meta && meta.md5Checksum) return meta.md5Checksum.toLowerCase();
-      } catch (driveErr) {}
-    }
-    if (file.getSize() / (1024 * 1024) > 15) return "";
-    const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, file.getBlob().getBytes());
-    return digest.map(b => ("0" + ((b < 0 ? b + 256 : b).toString(16))).slice(-2)).join("");
-  } catch (e) {
-    return "";
-  }
-}
-
-function prepareClassificationPayload(file, allowedFolders, subFolderPath = "", ruleOptions = {}) {
-  const lowerName = file.getName().toLowerCase();
-  const driveMime = (file.getMimeType() || "").toLowerCase();
-  const sizeInMB = file.getSize() / (1024 * 1024);
-
-  const isText = driveMime === "text/plain" || driveMime === "text/csv" ||
-                 lowerName.endsWith(".txt") || lowerName.endsWith(".csv");
-  const isWord = driveMime.includes("wordprocessingml") || driveMime === "application/msword" ||
-                 lowerName.endsWith(".docx") || lowerName.endsWith(".doc");
-  const isExcel = driveMime.includes("spreadsheetml") || driveMime === "application/vnd.ms-excel" ||
-                  lowerName.endsWith(".xlsx") || lowerName.endsWith(".xls");
-  const isPdf = driveMime === "application/pdf" || lowerName.endsWith(".pdf");
-  const isImage = driveMime.startsWith("image/") || /\.(jpg|jpeg|png|webp|heic)$/i.test(lowerName);
-
-  if (isText) {
-    const rawText = file.getBlob().getDataAsString("UTF-8");
-    if (rawText.trim().length > 10) {
-      return buildTextPayload(file, rawText, allowedFolders, `Text (${rawText.trim().length} Zeichen)`, subFolderPath, ruleOptions);
-    }
-  }
-
-  if (isWord || isExcel) {
-    try {
-      const extractedText = extractTextFromOfficeFile(file, isWord);
-      if (extractedText && extractedText.trim().length > 15) {
-        return buildTextPayload(file, extractedText, allowedFolders, `Office-Text (${extractedText.length} Zeichen)`, subFolderPath, ruleOptions);
-      }
-    } catch (officeErr) {}
-    return buildMetadataPayload(file, allowedFolders, "Office-Fehler", subFolderPath, ruleOptions);
-  }
-
-  if (isPdf) {
-    let ocrErrorNote = "";
-    if (sizeInMB <= 15) {
-      const ocrResult = extractTextFromPdfViaDrive(file);
-      if (ocrResult.text && ocrResult.text.length >= 40) {
-        return buildTextPayload(file, ocrResult.text, allowedFolders, `PDF-Text (${ocrResult.text.length} Zeichen)`, subFolderPath, ruleOptions);
-      }
-      ocrErrorNote = ocrResult.error;
-    }
-
-    const previewBlob = getPageOnePreviewImage(file);
-    if (previewBlob) {
-      const hint = ocrErrorNote ? `Seite-1-Bild (${ocrErrorNote})` : "Seite-1-Bild";
-      return buildInlinePayload(file, allowedFolders, hint, previewBlob, true, subFolderPath, ruleOptions);
-    }
-
-    return buildMetadataPayload(file, allowedFolders, ocrErrorNote || "PDF ohne Vorschau", subFolderPath, ruleOptions);
-  }
-
-  if (isImage) {
-    const resizedBlob = (file.getSize() > 200 * 1024) ? getPageOnePreviewImage(file) : null;
-    return buildInlinePayload(file, allowedFolders, resizedBlob ? "Bild (komprimiert)" : "Bild", resizedBlob, true, subFolderPath, ruleOptions);
-  }
-
-  return buildMetadataPayload(file, allowedFolders, "Unbekanntes Format", subFolderPath, ruleOptions);
-}
-
-function buildTextPayload(file, extractedText, allowedFolders, modeTag, subFolderPath = "", ruleOptions = {}) {
-  const folderSearchHint = subFolderPath ? `${subFolderPath} ${file.getName()}` : file.getName();
-  const filteredFolders = selectRelevantFolders(
-    allowedFolders,
-    folderSearchHint,
-    extractedText,
-    ruleOptions.boostedFolders || []
-  );
-  return {
-    modeTag: `${modeTag} | ${filteredFolders.length}/${allowedFolders.length} Ordner`,
-    payload: {
-      contents: [{
-        parts: [{
-          text: buildPrompt(file, filteredFolders, subFolderPath, ruleOptions.promptHint || "") + "\n\nINHALT:\n" + extractedText
-        }]
-      }],
-      generationConfig: getJsonConfig(false)
-    }
-  };
-}
-
-function buildInlinePayload(file, allowedFolders, modeTag, customBlob, useLowMediaRes, subFolderPath = "", ruleOptions = {}) {
-  const folderSearchHint = subFolderPath ? `${subFolderPath} ${file.getName()}` : file.getName();
-  const filteredFolders = selectRelevantFolders(
-    allowedFolders,
-    folderSearchHint,
-    "",
-    ruleOptions.boostedFolders || []
-  );
-  const fileBlob = customBlob || file.getBlob();
-  return {
-    modeTag: `${modeTag} | ${filteredFolders.length}/${allowedFolders.length} Ordner`,
-    payload: {
-      contents: [{
-        parts: [
-          { text: buildPrompt(file, filteredFolders, subFolderPath, ruleOptions.promptHint || "") },
-          { inline_data: { mime_type: fileBlob.getContentType(), data: Utilities.base64Encode(fileBlob.getBytes()) } }
-        ]
-      }],
-      generationConfig: getJsonConfig(useLowMediaRes)
-    }
-  };
-}
-
-function buildMetadataPayload(file, allowedFolders, reason, subFolderPath = "", ruleOptions = {}) {
-  const folderSearchHint = subFolderPath ? `${subFolderPath} ${file.getName()}` : file.getName();
-  const filteredFolders = selectRelevantFolders(
-    allowedFolders,
-    folderSearchHint,
-    "",
-    ruleOptions.boostedFolders || []
-  );
-  const fallbackDate = Utilities.formatDate(file.getDateCreated(), "Europe/Berlin", "yyyy-MM-dd");
-  const compactList = formatIndexedFolders(filteredFolders);
-  const folderContext = subFolderPath ? `, Inbox-Unterordner: "${subFolderPath}"` : "";
-  const ruleLine = ruleOptions.promptHint ? `\n${ruleOptions.promptHint}` : "";
-  const prompt = `Archivierung nur per Dateiname ("${reason}"). Datei: "${file.getName()}" (Datum: ${fallbackDate}${folderContext}).${ruleLine}
-Ordner-Index:
-${compactList}
-Regeln:
-- is_rechnung: true NUR wenn der Dateiname eindeutig auf eine Rechnung/Quittung hinweist, sonst false.
-- is_kontoauszug: true NUR wenn es sich um einen Bank-Kontoauszug, Finanzstatus oder eine Umsatzübersicht handelt, sonst false.
-- f: Passende Ordner-Nummer (Integer) aus Liste, oder -1 falls unklar. WICHTIG: Ordner unter "01_Finanzen" dürfen NUR bei is_rechnung = true ODER is_kontoauszug = true gewählt werden!
-- alt_f: Beste alternative Ordner-Nummer außerhalb von "01_Finanzen" (oder -1).
-- n: Dateiname nach Schema "${NAMING_CONVENTION}".
-- r: Deutsche Begründung (max. 8 Wörter).`;
-
-  return {
-    modeTag: `Nur-Dateiname: ${reason} | ${filteredFolders.length}/${allowedFolders.length} Ordner`,
-    payload: { contents: [{ parts: [{ text: prompt }] }], generationConfig: getJsonConfig(false) }
-  };
-}
-
-function createTempConvertedDriveFile(blob, tempName, targetMimeType, useOcr = false) {
-  if (typeof Drive === "undefined" || !Drive.Files) return null;
-  if (typeof Drive.Files.create === "function") {
-    const options = useOcr ? { ocrLanguage: "de" } : {};
-    return Drive.Files.create({ name: tempName, mimeType: targetMimeType }, blob, options).id;
-  }
-  if (typeof Drive.Files.insert === "function") {
-    const options = useOcr ? { ocr: true, ocrLanguage: "de" } : {};
-    return Drive.Files.insert({ title: tempName, mimeType: targetMimeType }, blob, options).id;
-  }
-  return null;
-}
-
-function deleteTempDriveFile(tempFileId) {
-  if (!tempFileId) return;
-  try {
-    if (typeof Drive !== "undefined" && Drive.Files) {
-      if (typeof Drive.Files.delete === "function") {
-        Drive.Files.delete(tempFileId);
-        return;
-      }
-      if (typeof Drive.Files.remove === "function") {
-        Drive.Files.remove(tempFileId);
-        return;
-      }
-    }
-    DriveApp.getFileById(tempFileId).setTrashed(true);
-  } catch (e) {}
-}
-
-function exportGoogleDocAsPlainText(fileId) {
-  const exportUrl = `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/plain`;
-  const res = UrlFetchApp.fetch(exportUrl, {
-    headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
-    muteHttpExceptions: true
-  });
-  if (res.getResponseCode() === 200) return res.getContentText("UTF-8");
-  return DocumentApp.openById(fileId).getBody().getText() || "";
-}
-
-function extractTextFromPdfViaDrive(file) {
-  if (typeof Drive === "undefined" || !Drive.Files) {
-    return { text: "", error: "Drive API nicht aktiv" };
-  }
-
-  let tempFileId = null;
-  try {
-    const pdfBlob = file.getBlob().setContentType("application/pdf");
-    tempFileId = createTempConvertedDriveFile(
-      pdfBlob,
-      "Temp_PDF_OCR_" + file.getName(),
-      "application/vnd.google-apps.document",
-      true
-    );
-    if (!tempFileId) return { text: "", error: "OCR-Konvertierung fehlgeschlagen" };
-
-    const rawText = exportGoogleDocAsPlainText(tempFileId);
-    const cleanText = rawText.replace(/\s+/g, " ").trim();
-    return { text: cleanText, error: cleanText.length < 40 ? "Kaum Text im PDF" : "" };
-  } catch (e) {
-    return { text: "", error: "OCR-Fehler" };
-  } finally {
-    deleteTempDriveFile(tempFileId);
-  }
-}
-
-function extractTextFromOfficeFile(file, isWord) {
-  if (typeof Drive === "undefined" || !Drive.Files) throw new Error("Drive-Dienst nicht aktiviert");
-
-  const targetMimeType = isWord ? "application/vnd.google-apps.document" : "application/vnd.google-apps.spreadsheet";
-  let tempFileId = null;
-
-  try {
-    tempFileId = createTempConvertedDriveFile(file.getBlob(), "Temp_Convert_" + file.getName(), targetMimeType, false);
-    if (!tempFileId) return "";
-
-    let extractedText = "";
-    if (isWord) {
-      extractedText = exportGoogleDocAsPlainText(tempFileId);
-    } else {
-      const sheet = SpreadsheetApp.openById(tempFileId);
-      const values = sheet.getDataRange().getDisplayValues();
-      const maxRows = Math.min(values.length, MAX_EXCEL_ROWS);
-      const lines = [];
-      for (let i = 0; i < maxRows; i++) lines.push(values[i].join(" | "));
-      extractedText = lines.join("\n");
-    }
-    return extractedText.replace(/\s+/g, " ").trim();
-  } finally {
-    deleteTempDriveFile(tempFileId);
-  }
-}
-
-function getPageOnePreviewImage(file) {
-  try {
-    const nativeThumb = file.getThumbnail();
-    if (nativeThumb && nativeThumb.getBytes().length > 1000) return nativeThumb;
-  } catch (e) {}
-
-  if (typeof Drive !== "undefined" && Drive.Files) {
-    try {
-      let meta;
-      try { meta = Drive.Files.get(file.getId(), { fields: "thumbnailLink" }); }
-      catch (v2Err) { meta = Drive.Files.get(file.getId()); }
-
-      if (meta && meta.thumbnailLink) {
-        const resizedUrl = meta.thumbnailLink.replace(/=s\d+.*$/, `=s${MAX_IMAGE_DIMENSION}`);
-        let res = UrlFetchApp.fetch(resizedUrl, { muteHttpExceptions: true });
-        if (res.getResponseCode() !== 200) {
-          res = UrlFetchApp.fetch(resizedUrl, {
-            headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
-            muteHttpExceptions: true
-          });
-        }
-        if (res.getResponseCode() === 200) {
-          const thumbBlob = res.getBlob();
-          if (thumbBlob.getContentType().startsWith("image/") && thumbBlob.getBytes().length > 1000) return thumbBlob;
-        }
-      }
-    } catch (e2) {}
-  }
-  return null;
-}
-
-
-// ==========================================
-// INTELLIGENTE ORDNER-VORFILTERUNG (MIT SCHUTZ FÜR NICHT-FINANZORDNER)
-// ==========================================
-function selectRelevantFolders(allowedFolders, fileName, extractedText, boostedFolders = []) {
-  const maxTotal = typeof MAX_MATCHED_FOLDERS !== "undefined" ? MAX_MATCHED_FOLDERS : 75;
-  if (allowedFolders.length <= maxTotal) {
-    return allowedFolders.map((path, idx) => ({ idx, path }));
-  }
-
-  const boostedSet = new Set(Array.isArray(boostedFolders) ? boostedFolders : []);
-  const pinnedBoosts = [];
-  const seenIdx = new Set();
-
-  allowedFolders.forEach((path, idx) => {
-    if (boostedSet.has(path) && !seenIdx.has(idx)) {
-      seenIdx.add(idx);
-      pinnedBoosts.push({ idx, path });
-    }
-  });
-
-  const stopWords = new Set([
-    "der", "die", "das", "und", "für", "von", "mit", "ein", "eine", "einer", "eines", "einem", "einen",
-    "dem", "den", "des", "aus", "bei", "nach", "zur", "zum", "als", "auf", "oder", "nicht", "wird",
-    "werden", "sind", "hat", "haben", "sich", "auch", "noch", "nur", "über", "unter", "durch", "gegen",
-    "ohne", "bis", "seit", "vor", "zwischen", "pdf", "jpg", "png", "docx", "xlsx", "dokument", "datei"
-  ]);
-
-  const normSource = typeof normalizeRuleText === "function"
-    ? normalizeRuleText(`${fileName} ${extractedText || ""}`)
-    : `${fileName} ${extractedText || ""}`.toLowerCase();
-
-  const rawTokens = normSource.match(/[a-z0-9]{3,}/g) || [];
-  const exactTokens = new Set();
-
-  rawTokens.forEach(tok => {
-    if (stopWords.has(tok)) return;
-    exactTokens.add(tok);
-  });
-
-  const scored = allowedFolders
-    .map((path, idx) => {
-      if (seenIdx.has(idx)) return null;
-      const cleanPath = path.replace(/\s*\/\s*/g, "/");
-      const depth = cleanPath.split("/").length;
-      const normPath = typeof normalizeRuleText === "function" ? normalizeRuleText(cleanPath) : cleanPath.toLowerCase();
-      const pathWords = normPath.match(/[a-z0-9]{3,}/g) || [];
-
-      let score = 0;
-      pathWords.forEach(pw => {
-        if (stopWords.has(pw)) return;
-        if (exactTokens.has(pw)) score += 3;
-      });
-
-      return { idx, path, depth, score, isFinance: isFinanceFolderPath(path) };
-    })
-    .filter(Boolean);
-
-  const remainingBudget = Math.max(0, maxTotal - pinnedBoosts.length);
-  const nonFinanceBudget = Math.max(10, Math.floor(remainingBudget * 0.6));
-  const financeBudget = Math.max(5, Math.floor(remainingBudget * 0.25));
-  const fallbackBudget = Math.max(0, remainingBudget - nonFinanceBudget - financeBudget);
-
-  // Getrennte Budgets, damit 01_Finanzen niemals Kunden-/Verwaltungsordner verdrängt
-  const matchedNonFinance = scored
-    .filter(item => !item.isFinance && item.score > 0)
-    .sort((a, b) => b.score - a.score || a.depth - b.depth)
-    .slice(0, nonFinanceBudget);
-
-  const matchedFinance = scored
-    .filter(item => item.isFinance && item.score > 0)
-    .sort((a, b) => b.score - a.score || a.depth - b.depth)
-    .slice(0, financeBudget);
-
-  const pickedIdx = new Set([
-    ...pinnedBoosts.map(x => x.idx),
-    ...matchedNonFinance.map(x => x.idx),
-    ...matchedFinance.map(x => x.idx)
-  ]);
-
-  const fallbackNonFinance = scored
-    .filter(item => !item.isFinance && !pickedIdx.has(item.idx))
-    .slice(0, fallbackBudget);
-
-  const combined = [...pinnedBoosts, ...matchedNonFinance, ...matchedFinance, ...fallbackNonFinance];
-  combined.sort((a, b) => a.idx - b.idx);
-  return combined.slice(0, maxTotal).map(item => ({ idx: item.idx, path: item.path }));
+function selectRelevantFolders(allowedFolders) {
+  return allowedFolders.map((path, idx) => ({ idx, path }));
 }
 
 
@@ -1213,35 +844,14 @@ function parseGeminiJsonResponse(responseText, allowedFolders) {
       ? allowedFolders[altIdx]
       : "MANUELLE_PRUEFUNG";
 
-    // Harte Prüfung: Darf das Dokument in "01_Finanzen" sortiert werden?
-    const hasAccountingFields = typeof rawParsed.t !== "undefined";
-    const isValidInvoiceType = !hasAccountingFields || (rawParsed.t === "Einnahme" || rawParsed.t === "Ausgabe");
-    const hasPositiveAmount = typeof rawParsed.v === "undefined" || Number(rawParsed.v) > 0;
-    const isUnambiguousInvoice = (rawParsed.is_rechnung === true) && isValidInvoiceType && hasPositiveAmount;
-    const isBankStatement = rawParsed.is_kontoauszug === true;
-
-    let reasoningText = rawParsed.r || "";
-    let docType = rawParsed.t || "";
-
-    if (isBankStatement) {
-      // Ausnahme: Kontoauszüge dürfen in "01_Finanzen" (z. B. Volks Bank), werden aber nicht als Einzelrechnung gebucht
-      docType = "Kontoauszug";
-    } else if (!isUnambiguousInvoice) {
-      if (docType === "Einnahme" || docType === "Ausgabe") {
-        docType = "Kein Beleg";
-      }
-
-      if (isFinanceFolderPath(resolvedFolder)) {
-        const blockedTarget = resolvedFolder;
-        if (altFolder !== "MANUELLE_PRUEFUNG" && !isFinanceFolderPath(altFolder)) {
-          resolvedFolder = altFolder;
-          reasoningText = `⚠️ Kein Rechnungsbeleg (${blockedTarget} gesperrt → umgeleitet): ${reasoningText}`;
-        } else {
-          resolvedFolder = "MANUELLE_PRUEFUNG";
-          reasoningText = `⚠️ Kein eindeutiger Rechnungsbeleg (${blockedTarget} gesperrt): ${reasoningText}`;
-        }
-      }
-    }
+    const guarded = typeof applyFinanceSortingGuardrail === "function"
+      ? applyFinanceSortingGuardrail(rawParsed, resolvedFolder, altFolder, rawParsed.r || "", rawParsed.t || "")
+      : {
+          folder_name: resolvedFolder,
+          reasoning: rawParsed.r || "",
+          docType: rawParsed.t || "",
+          amount: rawParsed.v
+        };
 
     const usage = json.usageMetadata || {};
     const totalTok = usage.totalTokenCount || 0;
@@ -1254,17 +864,17 @@ function parseGeminiJsonResponse(responseText, allowedFolders) {
       : `${totalTok} (In:${promptTok} Out:${outTok})`;
 
     return {
-      folder_name: resolvedFolder,
+      folder_name: guarded.folder_name,
       suggested_filename: rawParsed.n || "",
-      reasoning: reasoningText,
+      reasoning: guarded.reasoning,
       tokens: totalTok,
       tokenDisplay: detailStr,
-      t: docType,
+      t: guarded.docType,
       d: rawParsed.d,
       due: rawParsed.due,
       p: rawParsed.p,
       b: rawParsed.b,
-      v: isBankStatement ? 0 : rawParsed.v,
+      v: guarded.amount,
       c: rawParsed.c,
       k: rawParsed.k,
       s: rawParsed.s
@@ -1291,23 +901,19 @@ function buildPrompt(file, indexedFolderItems, subFolderPath = "", promptHint = 
   const compactList = formatIndexedFolders(indexedFolderItems);
   const subFolderHint = subFolderPath ? `, Inbox-Unterordner: "${subFolderPath}"` : "";
   const ruleHintBlock = promptHint ? `\n${promptHint}\n` : "\n";
+  const financeRulesBlock = typeof getFinancePromptRules === "function" ? getFinancePromptRules() : "";
 
   let prompt = `Archiviere Dokument (Original: "${file.getName()}", Fallback-Datum: ${fallbackDate}${subFolderHint}).
 ${ruleHintBlock}
-STRIKTE SORTIERREGEL FÜR "01_Finanzen" (UND ALLE UNTERORDNER VON "01_Finanzen"):
-- Ordner unter "01_Finanzen" (inklusive aller Unterordner!) sind AUSSCHLIESSLICH erlaubt für:
-  1. Eindeutige RECHNUNGEN, QUITTUNGEN oder KASSENBONS (mit klarem Rechnungssteller, Empfänger und Rechnungs-Endbetrag > 0).
-  2. AUSNAHME KONTOAUSZÜGE: Bank-Kontoauszüge, Finanzstatus- oder Umsatzübersichten (z. B. Volksbank Kontoauszug) – diese gehören in den entsprechenden Bank-/Volksbank-Ordner unter "01_Finanzen".
-- VERBOTEN für "01_Finanzen" sind alle anderen Dokumente wie z. B.: Kostenvoranschläge, Pflegeverträge, Abtretungserklärungen, reine Leistungsnachweise ohne Rechnungsstellung, Nachweise über Beratungsbesuche (§37 Abs. 3 SGB XI), Lieferscheine, Bestellbestätigungen, Angebote, Mahnungen ohne Rechnungsbeleg oder allgemeine Briefe/Infos.
-- Solche anderen Dokumente dürfen NIEMALS in "01_Finanzen" oder einen Unterordner von "01_Finanzen" sortiert werden! Wähle dafür stattdessen den passenden Kunden-, Kassen-, Auto- oder Organisationsordner (oder -1).
+${financeRulesBlock}
 
 Ordner-Index:
 ${compactList}
 
 Ausgabe-Regeln:
-- is_rechnung: true NUR wenn es sich eindeutig um eine Rechnung, Quittung oder einen Kassenbon mit Betrag > 0 handelt, sonst zwingend false.
+- is_rechnung: true NUR wenn es sich um eine Rechnung, Quittung, einen Kassenbon oder eine Gutschrift mit Brutto-/Endbetrag > 0 handelt (Dokumente mit "Abrechnung" sind KEINE Rechnungen, sofern nicht explizit als Rechnung/Quittung/Gutschrift ausgewiesen).
 - is_kontoauszug: true NUR wenn es sich um einen Bank-Kontoauszug, Finanzstatus oder eine Umsatzübersicht handelt, sonst zwingend false.
-- f: Passende Ordner-Nummer (Integer, spezifischsten Unterordner wählen, oder -1 falls unklar). Darf nur bei is_rechnung = true ODER is_kontoauszug = true auf "01_Finanzen" zeigen!
+- f: Passende Ordner-Nummer (Integer, spezifischsten Unterordner wählen, oder -1 falls unklar). Darf nur bei is_rechnung = true ODER is_kontoauszug = true auf "01_Finanzen" zeigen! Dokumente mit "Abrechnung" (ohne Rechnung/Quittung/Gutschrift/Kontoauszug) gehören in einen passenden Ordner AUSSERHALB von "01_Finanzen".
 - alt_f: Beste alternative Ordner-Nummer außerhalb von "01_Finanzen" (oder -1, falls unklar).
 - n: Dateiname nach "${NAMING_CONVENTION}" mit Dokumentendatum (sonst ${fallbackDate}). Ohne / : * ? " < > |.
 - r: Kurze deutsche Begründung (max. 8 Wörter).`;
@@ -1481,15 +1087,4 @@ function executeGeminiCall(payload, allowedFolders, ss, stepInfo, fileName) {
     }
   }
   return { folder_name: "API-Fehler (" + lastErrorCode + ")", suggested_filename: "", reasoning: lastErrorMsg, tokens: 0, tokenDisplay: "0" };
-}
-
-function ensureFileExtension(originalName, newName) {
-  let sanitized = newName.replace(/[\/\\:*?"<>|]/g, "-").trim();
-  const lastDotIndex = originalName.lastIndexOf(".");
-  if (lastDotIndex > 0 && (originalName.length - lastDotIndex) <= 6) {
-    const ext = originalName.substring(lastDotIndex).toLowerCase();
-    sanitized = sanitized.replace(/\.(pdf|jpe?g|png|webp|heic|txt|csv|docx?|xlsx?)$/i, "");
-    return sanitized + ext;
-  }
-  return sanitized;
 }

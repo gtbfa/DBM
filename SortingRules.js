@@ -1,22 +1,139 @@
 // ==========================================
-// DETERMINISTISCHE SORTIERREGELN (VOR-ROUTING)
+// DETERMINISTISCHE SORTIERREGELN & 01_FINANZEN-LOGIK
 // ==========================================
-// Auswertung in Prioritätsreihenfolge (höchster `priority`-Wert zuerst).
-// Modi:
-//   - "HARD_ROUTE": Setzt den Zielordner direkt (0 Gemini-Tokens), sofern der
-//     Pfad in `folderMap` existiert und die 01_Finanzen-Prüfung besteht.
-//   - "BOOST_CANDIDATES": Hebt passende Ordner in `selectRelevantFolders` hervor
-//     und ergänzt einen kompakten Hinweis im Gemini-Prompt.
-//
-// Neue / unbekannte Klienten:
-//   - Bekannte Klienten werden aus `KNOWN_CLIENTS` UND dynamisch aus
-//     `Ordner_Whitelist` (z. B. unter `03_Klienten_Verwaltung` / `07_Abrechnung`)
-//     sowie aus optionalen KI-/Partnernamen erkannt.
-//   - Wenn ein Dokument klar nach Klienten-/Pflege-/Abrechnungsbezug aussieht,
-//     aber kein bekannter Klient bzw. kein passender Klientenordner in der
-//     Whitelist gefunden wird, erfolgt KEINE automatische Ordneranlage; stattdessen
-//     wird auf `MANUELLE_PRUEFUNG` (oder einen vorhandenen Prüf-/Staging-Ordner)
-//     geroutet, damit Sie die Ordneranlage vollständig selbst steuern.
+
+function isFinanceFolderPath(folderPath) {
+  if (!folderPath) return false;
+  const normalized = folderPath.toString().trim().replace(/\s*\/\s*/g, "/").toLowerCase();
+  return normalized === "01_finanzen" || normalized.startsWith("01_finanzen/");
+}
+
+function isBankStatementDoc(fileName, reasoning) {
+  const combined = `${fileName || ""} ${reasoning || ""}`.toLowerCase();
+  return ["kontoauszug", "finanzstatus", "umsatzübersicht", "umsatzauskunft"].some(kw => combined.includes(kw));
+}
+
+function hasAbrechnungSignal(normalizedText) {
+  if (!normalizedText) return false;
+  return /\babrechnung\b/.test(normalizedText);
+}
+
+function hasGermanInvoiceSignals(normalizedText) {
+  if (!normalizedText) return false;
+
+  const nonInvoiceSignals = [
+    "abrechnung",
+    "kostenvoranschlag",
+    "pflegevertrag",
+    "abtretungserklaerung",
+    "beratungsbesuch",
+    "37 abs. 3",
+    "37 abs 3",
+    "leistungsnachweis"
+  ];
+  const hasStrongInvoiceWord = [
+    "rechnung",
+    "rechnungsnr",
+    "rechnungsnummer",
+    "rechnungsbetrag",
+    "gesamtbetrag",
+    "endbetrag",
+    "zahlbetrag",
+    "quittung",
+    "kassenbon",
+    "gutschrift",
+    "honorarrechnung"
+  ].some(kw => normalizedText.includes(kw));
+
+  if (hasStrongInvoiceWord) return true;
+
+  const hasEigenanteilInvoiceContext = normalizedText.includes("eigenanteil") &&
+    /\b(brutto|mwst|ust|iban|zahlungsziel|faellig|betrag|eur)\b/.test(normalizedText);
+  const looksLikeNonInvoiceForm = nonInvoiceSignals.some(kw => normalizedText.includes(kw));
+
+  return hasEigenanteilInvoiceContext && !looksLikeNonInvoiceForm;
+}
+
+function getFinancePromptRules() {
+  return `STRIKTE SORTIERREGEL FÜR "01_Finanzen" (UND ALLE UNTERORDNER VON "01_Finanzen"):
+- Ordner unter "01_Finanzen" (inklusive aller Unterordner!) sind erlaubt für:
+  1. Eindeutige RECHNUNGEN, QUITTUNGEN, KASSENBONS oder GUTSCHRIFTEN (deutschsprachige Belege mit Endbetrag/Brutto/Rechnungsbetrag > 0).
+  2. AUSNAHME KONTOAUSZÜGE: Bank-Kontoauszüge, Finanzstatus- oder Umsatzübersichten (z. B. Volksbank Kontoauszug) – diese gehören in den entsprechenden Bank-/Volksbank-Ordner unter "01_Finanzen".
+- VERBOTEN für "01_Finanzen" sind Dokumente mit "Abrechnung" (soweit keine explizite Rechnung/Quittung/Gutschrift/Kontoauszug vorliegt) sowie Nicht-Rechnungsdokumente wie: Kostenvoranschläge, Pflegeverträge, Abtretungserklärungen, reine Leistungsnachweise ohne Rechnungsbetrag, Nachweise über Beratungsbesuche (§37 Abs. 3 SGB XI), unverbindliche Angebote oder reine Informationsschreiben.
+- Solche Dokumente müssen in einen passenden Ordner AUSSERHALB von "01_Finanzen" (z. B. unter "07_Abrechnung" oder "03_Klienten_Verwaltung") sortiert werden.`;
+}
+
+function applyFinanceSortingGuardrail(rawParsed, resolvedFolder, altFolder, reasoningText, docType) {
+  const hasAccountingFields = typeof rawParsed.t !== "undefined";
+  const isValidInvoiceType = !hasAccountingFields || (rawParsed.t === "Einnahme" || rawParsed.t === "Ausgabe");
+  const parsedAmount = Number(rawParsed.v);
+  const hasPositiveAmount = typeof rawParsed.v === "undefined" || (!isNaN(parsedAmount) && parsedAmount > 0);
+  const isUnambiguousInvoice = (rawParsed.is_rechnung === true) && isValidInvoiceType && hasPositiveAmount;
+  const isBankStatement = rawParsed.is_kontoauszug === true;
+
+  let nextFolder = resolvedFolder;
+  let nextReason = reasoningText;
+  let nextDocType = docType;
+  let nextAmount = rawParsed.v;
+
+  if (isBankStatement) {
+    nextDocType = "Kontoauszug";
+    nextAmount = 0;
+  } else if (!isUnambiguousInvoice) {
+    if (nextDocType === "Einnahme" || nextDocType === "Ausgabe") {
+      nextDocType = "Kein Beleg";
+    }
+
+    if (isFinanceFolderPath(nextFolder)) {
+      const blockedTarget = nextFolder;
+      if (altFolder !== "MANUELLE_PRUEFUNG" && !isFinanceFolderPath(altFolder)) {
+        nextFolder = altFolder;
+        nextReason = `⚠️ Kein Rechnungsbeleg / Abrechnung (${blockedTarget} gesperrt → umgeleitet): ${nextReason}`;
+      } else {
+        nextFolder = "MANUELLE_PRUEFUNG";
+        nextReason = `⚠️ Kein Rechnungsbeleg / Abrechnung (${blockedTarget} gesperrt): ${nextReason}`;
+      }
+    }
+  }
+
+  return {
+    folder_name: nextFolder,
+    reasoning: nextReason,
+    docType: nextDocType,
+    amount: nextAmount,
+    isBankStatement: isBankStatement
+  };
+}
+
+function canMoveToFinanceFolder(targetFolderName, isAiSuggestion, bType, bAmount, originalName, newNameInput, reasoning) {
+  const isFinanceTarget = isFinanceFolderPath(targetFolderName);
+  const isConfirmedInvoice = (bType === "Einnahme" || bType === "Ausgabe") && bAmount > 0;
+  const isBankStatement = bType === "Kontoauszug" || isBankStatementDoc(`${originalName} ${newNameInput}`, reasoning);
+  const allowed = !(isAiSuggestion && isFinanceTarget && !isConfirmedInvoice && !isBankStatement);
+
+  return {
+    allowed: allowed,
+    isFinanceTarget: isFinanceTarget,
+    isConfirmedInvoice: isConfirmedInvoice,
+    isBankStatement: isBankStatement
+  };
+}
+
+function partitionFinanceCandidateFolders(scoredItems, financeBudget, fallbackBudget, pickedIdx) {
+  const matchedFinance = scoredItems
+    .filter(item => isFinanceFolderPath(item.path) && item.score > 0)
+    .sort((a, b) => b.score - a.score || a.depth - b.depth)
+    .slice(0, financeBudget);
+
+  const fallbackNonFinance = scoredItems
+    .filter(item => !isFinanceFolderPath(item.path) && !pickedIdx.has(item.idx))
+    .slice(0, fallbackBudget);
+
+  return {
+    matchedFinance: matchedFinance,
+    fallbackNonFinance: fallbackNonFinance
+  };
+}
 
 const SORTING_RULES = [
   {
@@ -112,6 +229,64 @@ const SORTING_RULES = [
     }
   },
   {
+    id: "ABRECHNUNG_NON_FINANCE_ROUTING",
+    priority: 89,
+    mode: "HARD_ROUTE",
+    requiresFinanceCheck: false,
+    docTypeHint: "Kein Beleg",
+    when: {
+      customPredicate: "hasAbrechnungSignal",
+      excludeKeywords: [
+        "rechnung",
+        "rechnungsnr",
+        "rechnungsnummer",
+        "rechnungsbetrag",
+        "quittung",
+        "kassenbon",
+        "gutschrift",
+        "kontoauszug",
+        "finanzstatus"
+      ]
+    },
+    then: {
+      targetFolderPatterns: [
+        "07_Abrechnung / {client} / {period}",
+        "07_Abrechnung / {client}",
+        "03_Klienten_Verwaltung / {client}",
+        "07_Abrechnung",
+        "MANUELLE_PRUEFUNG"
+      ],
+      reason: "Regel: 'Abrechnung' (keine Rechnung) → Ziel außerhalb 01_Finanzen"
+    }
+  },
+  {
+    id: "INVOICE_FINANCE_CANDIDATE_BOOST",
+    priority: 88,
+    mode: "BOOST_CANDIDATES",
+    requiresFinanceCheck: false,
+    when: {
+      customPredicate: "hasGermanInvoiceSignals"
+    },
+    then: {
+      boostFolderPatterns: [
+        "01_Finanzen / 02_Ausgangsrechnungen / 03-1_Krankenkassen_SGB_V",
+        "01_Finanzen / 02_Ausgangsrechnungen / 03-2_Pflegekassen_SGB_XI",
+        "01_Finanzen / 02_Ausgangsrechnungen / 03-3_Sozialhilfeträger_SGB_XII",
+        "01_Finanzen / 02_Ausgangsrechnungen / 03-4_Privatzahler_und_Eigenanteile",
+        "01_Finanzen / 02_Ausgangsrechnungen / 03-5_Absetzungen_Korrekturen_Gutschriften",
+        "01_Finanzen / 03_Eingangsrechnungen / 04-1_Pflege_und_Medizinbedarf_Kleidung",
+        "01_Finanzen / 03_Eingangsrechnungen / 04-2_Fahrzeugkosten",
+        "01_Finanzen / 03_Eingangsrechnungen / 04-3_IT_Software",
+        "01_Finanzen / 03_Eingangsrechnungen / 04-4_Raumkosten_und_Bürobetrieb",
+        "01_Finanzen / 03_Eingangsrechnungen / 04-5_Versicherungen_Beiträge_Gebühren",
+        "01_Finanzen / 03_Eingangsrechnungen / 04-6_Personal_Fortbildung_und_Beratung",
+        "01_Finanzen / 03_Eingangsrechnungen / 04-7_Anlagevermögen_und_Investitionen",
+        "01_Finanzen / 03_Eingangsrechnungen / 04-8_Belege"
+      ],
+      reason: "Regel: Rechnungsbeleg erkannt – 01_Finanzen-Ordner priorisiert"
+    }
+  },
+  {
     id: "CLIENT_BILLING_PERIOD_ROUTING",
     priority: 80,
     mode: "BOOST_CANDIDATES",
@@ -122,7 +297,9 @@ const SORTING_RULES = [
     then: {
       boostFolderPatterns: [
         "07_Abrechnung / {client}",
-        "03_Klienten_Verwaltung / {client}"
+        "03_Klienten_Verwaltung / {client}",
+        "01_Finanzen / 02_Ausgangsrechnungen / 03-2_Pflegekassen_SGB_XI",
+        "01_Finanzen / 02_Ausgangsrechnungen / 03-4_Privatzahler_und_Eigenanteile"
       ],
       reason: "Regel: Klientenzuordnung ({client})"
     }
@@ -146,20 +323,33 @@ const SORTING_RULES = [
         "abrechnung"
       ],
       excludeKeywords: [
+        "rechnung",
+        "rechnungsnr",
+        "rechnungsnummer",
+        "rechnungsbetrag",
+        "gesamtbetrag",
+        "endbetrag",
+        "brutto",
+        "quittung",
+        "kassenbon",
+        "gutschrift",
         "kontoauszug",
         "finanzstatus",
         "volksbank",
         "domainfactory",
         "google workspace",
         "bgw",
-        "gothaer"
+        "gothaer",
+        "sbk",
+        "aok",
+        "dak"
       ]
     },
     then: {
       targetFolderPatterns: [
         "MANUELLE_PRUEFUNG"
       ],
-      reason: "Regel: Möglicher neuer Klient – manuelle Prüfung (keine automatische Ordneranlage)"
+      reason: "Regel: Möglicher neuer Klient / Nicht-Rechnung – manuelle Prüfung"
     }
   },
   {
@@ -178,7 +368,9 @@ const SORTING_RULES = [
     then: {
       boostFolderPatterns: [
         "02_Organisation_und_Zulassungen / 01-4_Betriebsversicherungen / Krankenkasse SBK_2026",
-        "01_Finanzen / 03_Eingangsrechnungen"
+        "01_Finanzen / 03_Eingangsrechnungen / 04-5_Versicherungen_Beiträge_Gebühren",
+        "01_Finanzen / 02_Ausgangsrechnungen / 03-1_Krankenkassen_SGB_V",
+        "01_Finanzen / 02_Ausgangsrechnungen / 03-2_Pflegekassen_SGB_XI"
       ],
       reason: "Regel: Krankenkasse / SBK"
     }
@@ -199,7 +391,8 @@ const SORTING_RULES = [
     },
     then: {
       boostFolderPatterns: [
-        "01_Finanzen / 03_Eingangsrechnungen",
+        "01_Finanzen / 03_Eingangsrechnungen / 04-3_IT_Software",
+        "01_Finanzen / 03_Eingangsrechnungen / 04-8_Belege",
         "02_Organisation_und_Zulassungen"
       ],
       reason: "Regel: IT / Domain / Workspace"
@@ -223,8 +416,9 @@ const SORTING_RULES = [
     },
     then: {
       boostFolderPatterns: [
-        "01_Finanzen / 03_Eingangsrechnungen",
-        "02_Organisation_und_Zulassungen / 01-4_Betriebsversicherungen"
+        "01_Finanzen / 03_Eingangsrechnungen / 04-5_Versicherungen_Beiträge_Gebühren",
+        "01_Finanzen / 03_Eingangsrechnungen / 04-2_Fahrzeugkosten",
+        "02_Organisation_und_Zulassungen / 01-4_Betriebsversicherungen / Berufshaftpflichtversicherung"
       ],
       reason: "Regel: Versicherung / BGW / Auto"
     }
@@ -238,6 +432,7 @@ const KNOWN_CLIENTS = [
   { canonical: "Eva Rotter", variants: ["eva rotter", "rotter eva", "eva_rotter", "rotter_eva"] },
   { canonical: "Henriette Deligne", variants: ["henriette deligne", "deligne henriette", "henriette_deligne"] },
   { canonical: "Margret Obermeier-Hartmann", variants: ["margret obermeier-hartmann", "margret obermeier hartmann", "obermeier-hartmann", "obermeier hartmann"] },
+  { canonical: "Gerd Obermeier-Hartmann", variants: ["gerd obermeier-hartmann", "gerd obermeier hartmann", "gerd_obermeier"] },
   { canonical: "Renate Peters", variants: ["renate peters", "peters renate", "renate_peters"] },
   { canonical: "Yvonne Schwerdtfeger", variants: ["yvonne schwerdtfeger", "schwerdtfeger yvonne", "yvonne_schwerdtfeger"] },
   { canonical: "Hak Abu Haj", variants: ["hak abu haj", "hak-abu-haj", "hak_abu_haj", "abu haj"] },
@@ -292,7 +487,7 @@ function extractDynamicClientsFromFolderMap(folderMap) {
       if (!remainder) continue;
       const firstSegment = remainder.split("/")[0].trim();
       if (!firstSegment || firstSegment.length < 4 || ignoredLeafTokens.has(firstSegment)) continue;
-      if (/^(januar|februar|maerz|marz|april|mai|juni|juli|august|september|oktober|november|dezember)/.test(firstSegment)) {
+      if (/^(januar|februar|maerz|marz|april|mai|juni|juli|august|september|oktober|november|dezember) /.test(firstSegment)) {
         continue;
       }
 
@@ -385,7 +580,9 @@ function buildSortingContext(file, extractedText, subFolderPath, folderMap, extr
     normalizedHeader: normalizedHeader,
     clientName: clientInfo.name,
     isKnownClient: clientInfo.isKnown,
-    periodLabel: detectBillingPeriodLabel(normalizedAll)
+    periodLabel: detectBillingPeriodLabel(normalizedAll),
+    isInvoiceCandidate: hasGermanInvoiceSignals(normalizedAll),
+    isAbrechnungDoc: hasAbrechnungSignal(normalizedAll)
   };
 }
 
@@ -430,6 +627,14 @@ function matchesRuleConditions(whenCfg, ctx) {
   }
 
   if (whenCfg.requiresUnknownClient === true && ctx.isKnownClient) {
+    return false;
+  }
+
+  if (whenCfg.customPredicate === "hasGermanInvoiceSignals" && !ctx.isInvoiceCandidate) {
+    return false;
+  }
+
+  if (whenCfg.customPredicate === "hasAbrechnungSignal" && !ctx.isAbrechnungDoc) {
     return false;
   }
 
@@ -480,11 +685,11 @@ function evaluateSortingRules(ctx, folderMap) {
         const resolvedFolder = resolveFolderPattern(rule.then.targetFolderPatterns[p], ctx, folderMap);
         if (!resolvedFolder) continue;
 
-        const isFinance = typeof isFinanceFolderPath === "function"
-          ? isFinanceFolderPath(resolvedFolder)
-          : resolvedFolder.toLowerCase().startsWith("01_finanzen");
-
+        const isFinance = isFinanceFolderPath(resolvedFolder);
         if (rule.requiresFinanceCheck && isFinance && rule.docTypeHint !== "Kontoauszug") {
+          continue;
+        }
+        if (rule.id === "ABRECHNUNG_NON_FINANCE_ROUTING" && isFinance) {
           continue;
         }
 
