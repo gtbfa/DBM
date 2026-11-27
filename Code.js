@@ -261,21 +261,60 @@ function analyzeInboxFiles() {
         tokenDisplay: "0"
       };
     } else {
-      updateLiveStatus(ss, `[2/4] Lese Dateiinhalt aus "${displayLocation}" aus (OCR / Text / Vorschau)...`, stepPrefix, 5);
-      const prep = prepareClassificationPayload(file, allowedFolders, subFolderPath);
+      let ruleEval = {
+        mode: "FALLBACK_LLM",
+        boostedFolders: [],
+        promptHint: ""
+      };
 
-      if (prep && prep.payload) {
-        updateLiveStatus(ss, `[3/4] Extraktion fertig (${prep.modeTag}). Sende Anfrage an Gemini KI...`, stepPrefix, 8);
-        aiResult = executeGeminiCall(prep.payload, allowedFolders, ss, stepPrefix, fileName);
-        aiResult.reasoning = `${aiResult.reasoning} [${prep.modeTag}]`;
-      } else {
+      if (typeof buildSortingContext === "function" && typeof evaluateSortingRules === "function") {
+        const ctx = buildSortingContext(file, "", subFolderPath, folderMap, "");
+        ruleEval = evaluateSortingRules(ctx, folderMap);
+      }
+
+      if (ruleEval.mode === "HARD_ROUTE" && ruleEval.folder_name) {
+        updateLiveStatus(
+          ss,
+          `[2/4] Regel-Treffer (${ruleEval.ruleId}) → "${ruleEval.folder_name}" (0 Tokens).`,
+          stepPrefix,
+          5
+        );
         aiResult = {
-          folder_name: "Fehler bei Analyse",
+          folder_name: ruleEval.folder_name,
           suggested_filename: fileName,
-          reasoning: "Dokument konnte nicht vorbereitet werden",
+          reasoning: `${ruleEval.reasoning} [Regel-Routing]`,
           tokens: 0,
-          tokenDisplay: "0"
+          tokenDisplay: ruleEval.tokenDisplay || "0 (Regel)",
+          t: ruleEval.t || "",
+          d: "",
+          due: "",
+          p: ruleEval.p || "",
+          b: "",
+          v: typeof ruleEval.v === "number" ? ruleEval.v : 0,
+          c: "EUR",
+          k: ruleEval.k || "",
+          s: ""
         };
+      } else {
+        updateLiveStatus(ss, `[2/4] Lese Dateiinhalt aus "${displayLocation}" aus (OCR / Text / Vorschau)...`, stepPrefix, 5);
+        const prep = prepareClassificationPayload(file, allowedFolders, subFolderPath, {
+          boostedFolders: ruleEval.boostedFolders || [],
+          promptHint: ruleEval.promptHint || ""
+        });
+
+        if (prep && prep.payload) {
+          updateLiveStatus(ss, `[3/4] Extraktion fertig (${prep.modeTag}). Sende Anfrage an Gemini KI...`, stepPrefix, 8);
+          aiResult = executeGeminiCall(prep.payload, allowedFolders, ss, stepPrefix, fileName);
+          aiResult.reasoning = `${aiResult.reasoning} [${prep.modeTag}]`;
+        } else {
+          aiResult = {
+            folder_name: "Fehler bei Analyse",
+            suggested_filename: fileName,
+            reasoning: "Dokument konnte nicht vorbereitet werden",
+            tokens: 0,
+            tokenDisplay: "0"
+          };
+        }
       }
     }
 
@@ -668,12 +707,299 @@ function ensureReviewSheetHeaders(ss) {
 
 
 // ==========================================
+// DOKUMENT-EXTRAKTION & DRIVE-HILFSFUNKTIONEN
+// ==========================================
+function computeFileHash(file) {
+  try {
+    if (typeof Drive !== "undefined" && Drive.Files) {
+      try {
+        const meta = Drive.Files.get(file.getId(), { fields: "md5Checksum" });
+        if (meta && meta.md5Checksum) return meta.md5Checksum.toLowerCase();
+      } catch (driveErr) {}
+    }
+    if (file.getSize() / (1024 * 1024) > 15) return "";
+    const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, file.getBlob().getBytes());
+    return digest.map(b => ("0" + ((b < 0 ? b + 256 : b).toString(16))).slice(-2)).join("");
+  } catch (e) {
+    return "";
+  }
+}
+
+function prepareClassificationPayload(file, allowedFolders, subFolderPath = "", ruleOptions = {}) {
+  const lowerName = file.getName().toLowerCase();
+  const driveMime = (file.getMimeType() || "").toLowerCase();
+  const sizeInMB = file.getSize() / (1024 * 1024);
+
+  const isText = driveMime === "text/plain" || driveMime === "text/csv" ||
+                 lowerName.endsWith(".txt") || lowerName.endsWith(".csv");
+  const isWord = driveMime.includes("wordprocessingml") || driveMime === "application/msword" ||
+                 lowerName.endsWith(".docx") || lowerName.endsWith(".doc");
+  const isExcel = driveMime.includes("spreadsheetml") || driveMime === "application/vnd.ms-excel" ||
+                  lowerName.endsWith(".xlsx") || lowerName.endsWith(".xls");
+  const isPdf = driveMime === "application/pdf" || lowerName.endsWith(".pdf");
+  const isImage = driveMime.startsWith("image/") || /\.(jpg|jpeg|png|webp|heic)$/i.test(lowerName);
+
+  if (isText) {
+    const rawText = file.getBlob().getDataAsString("UTF-8").substring(0, MAX_EXTRACTED_CHARS);
+    if (rawText.trim().length > 10) {
+      return buildTextPayload(file, rawText, allowedFolders, `Text (${rawText.trim().length} Zeichen)`, subFolderPath, ruleOptions);
+    }
+  }
+
+  if (isWord || isExcel) {
+    try {
+      const extractedText = extractTextFromOfficeFile(file, isWord);
+      if (extractedText && extractedText.trim().length > 15) {
+        return buildTextPayload(file, extractedText, allowedFolders, `Office-Text (${extractedText.length} Zeichen)`, subFolderPath, ruleOptions);
+      }
+    } catch (officeErr) {}
+    return buildMetadataPayload(file, allowedFolders, "Office-Fehler", subFolderPath, ruleOptions);
+  }
+
+  if (isPdf) {
+    let ocrErrorNote = "";
+    if (sizeInMB <= 15) {
+      const ocrResult = extractTextFromPdfViaDrive(file);
+      if (ocrResult.text && ocrResult.text.length >= 40) {
+        return buildTextPayload(file, ocrResult.text, allowedFolders, `PDF-Text (${ocrResult.text.length} Zeichen)`, subFolderPath, ruleOptions);
+      }
+      ocrErrorNote = ocrResult.error;
+    }
+
+    const previewBlob = getPageOnePreviewImage(file);
+    if (previewBlob) {
+      const hint = ocrErrorNote ? `Seite-1-Bild (${ocrErrorNote})` : "Seite-1-Bild";
+      return buildInlinePayload(file, allowedFolders, hint, previewBlob, true, subFolderPath, ruleOptions);
+    }
+
+    return buildMetadataPayload(file, allowedFolders, ocrErrorNote || "PDF ohne Vorschau", subFolderPath, ruleOptions);
+  }
+
+  if (isImage) {
+    const resizedBlob = (file.getSize() > 200 * 1024) ? getPageOnePreviewImage(file) : null;
+    return buildInlinePayload(file, allowedFolders, resizedBlob ? "Bild (komprimiert)" : "Bild", resizedBlob, true, subFolderPath, ruleOptions);
+  }
+
+  return buildMetadataPayload(file, allowedFolders, "Unbekanntes Format", subFolderPath, ruleOptions);
+}
+
+function buildTextPayload(file, extractedText, allowedFolders, modeTag, subFolderPath = "", ruleOptions = {}) {
+  const folderSearchHint = subFolderPath ? `${subFolderPath} ${file.getName()}` : file.getName();
+  const filteredFolders = selectRelevantFolders(
+    allowedFolders,
+    folderSearchHint,
+    extractedText,
+    ruleOptions.boostedFolders || []
+  );
+  return {
+    modeTag: `${modeTag} | ${filteredFolders.length}/${allowedFolders.length} Ordner`,
+    payload: {
+      contents: [{
+        parts: [{
+          text: buildPrompt(file, filteredFolders, subFolderPath, ruleOptions.promptHint || "") + "\n\nINHALT:\n" + extractedText
+        }]
+      }],
+      generationConfig: getJsonConfig(false)
+    }
+  };
+}
+
+function buildInlinePayload(file, allowedFolders, modeTag, customBlob, useLowMediaRes, subFolderPath = "", ruleOptions = {}) {
+  const folderSearchHint = subFolderPath ? `${subFolderPath} ${file.getName()}` : file.getName();
+  const filteredFolders = selectRelevantFolders(
+    allowedFolders,
+    folderSearchHint,
+    "",
+    ruleOptions.boostedFolders || []
+  );
+  const fileBlob = customBlob || file.getBlob();
+  return {
+    modeTag: `${modeTag} | ${filteredFolders.length}/${allowedFolders.length} Ordner`,
+    payload: {
+      contents: [{
+        parts: [
+          { text: buildPrompt(file, filteredFolders, subFolderPath, ruleOptions.promptHint || "") },
+          { inline_data: { mime_type: fileBlob.getContentType(), data: Utilities.base64Encode(fileBlob.getBytes()) } }
+        ]
+      }],
+      generationConfig: getJsonConfig(useLowMediaRes)
+    }
+  };
+}
+
+function buildMetadataPayload(file, allowedFolders, reason, subFolderPath = "", ruleOptions = {}) {
+  const folderSearchHint = subFolderPath ? `${subFolderPath} ${file.getName()}` : file.getName();
+  const filteredFolders = selectRelevantFolders(
+    allowedFolders,
+    folderSearchHint,
+    "",
+    ruleOptions.boostedFolders || []
+  );
+  const fallbackDate = Utilities.formatDate(file.getDateCreated(), "Europe/Berlin", "yyyy-MM-dd");
+  const compactList = formatIndexedFolders(filteredFolders);
+  const folderContext = subFolderPath ? `, Inbox-Unterordner: "${subFolderPath}"` : "";
+  const ruleLine = ruleOptions.promptHint ? `\n${ruleOptions.promptHint}` : "";
+  const prompt = `Archivierung nur per Dateiname ("${reason}"). Datei: "${file.getName()}" (Datum: ${fallbackDate}${folderContext}).${ruleLine}
+Ordner-Index:
+${compactList}
+Regeln:
+- is_rechnung: true NUR wenn der Dateiname eindeutig auf eine Rechnung/Quittung hinweist, sonst false.
+- is_kontoauszug: true NUR wenn es sich um einen Bank-Kontoauszug, Finanzstatus oder eine Umsatzübersicht handelt, sonst false.
+- f: Passende Ordner-Nummer (Integer) aus Liste, oder -1 falls unklar. WICHTIG: Ordner unter "01_Finanzen" dürfen NUR bei is_rechnung = true ODER is_kontoauszug = true gewählt werden!
+- alt_f: Beste alternative Ordner-Nummer außerhalb von "01_Finanzen" (oder -1).
+- n: Dateiname nach Schema "${NAMING_CONVENTION}".
+- r: Deutsche Begründung (max. 8 Wörter).`;
+
+  return {
+    modeTag: `Nur-Dateiname: ${reason} | ${filteredFolders.length}/${allowedFolders.length} Ordner`,
+    payload: { contents: [{ parts: [{ text: prompt }] }], generationConfig: getJsonConfig(false) }
+  };
+}
+
+function createTempConvertedDriveFile(blob, tempName, targetMimeType, useOcr = false) {
+  if (typeof Drive === "undefined" || !Drive.Files) return null;
+  if (typeof Drive.Files.create === "function") {
+    const options = useOcr ? { ocrLanguage: "de" } : {};
+    return Drive.Files.create({ name: tempName, mimeType: targetMimeType }, blob, options).id;
+  }
+  if (typeof Drive.Files.insert === "function") {
+    const options = useOcr ? { ocr: true, ocrLanguage: "de" } : {};
+    return Drive.Files.insert({ title: tempName, mimeType: targetMimeType }, blob, options).id;
+  }
+  return null;
+}
+
+function deleteTempDriveFile(tempFileId) {
+  if (!tempFileId) return;
+  try {
+    if (typeof Drive !== "undefined" && Drive.Files) {
+      if (typeof Drive.Files.delete === "function") {
+        Drive.Files.delete(tempFileId);
+        return;
+      }
+      if (typeof Drive.Files.remove === "function") {
+        Drive.Files.remove(tempFileId);
+        return;
+      }
+    }
+    DriveApp.getFileById(tempFileId).setTrashed(true);
+  } catch (e) {}
+}
+
+function exportGoogleDocAsPlainText(fileId) {
+  const exportUrl = `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/plain`;
+  const res = UrlFetchApp.fetch(exportUrl, {
+    headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
+    muteHttpExceptions: true
+  });
+  if (res.getResponseCode() === 200) return res.getContentText("UTF-8");
+  return DocumentApp.openById(fileId).getBody().getText() || "";
+}
+
+function extractTextFromPdfViaDrive(file) {
+  if (typeof Drive === "undefined" || !Drive.Files) {
+    return { text: "", error: "Drive API nicht aktiv" };
+  }
+
+  let tempFileId = null;
+  try {
+    const pdfBlob = file.getBlob().setContentType("application/pdf");
+    tempFileId = createTempConvertedDriveFile(
+      pdfBlob,
+      "Temp_PDF_OCR_" + file.getName(),
+      "application/vnd.google-apps.document",
+      true
+    );
+    if (!tempFileId) return { text: "", error: "OCR-Konvertierung fehlgeschlagen" };
+
+    const rawText = exportGoogleDocAsPlainText(tempFileId);
+    const cleanText = rawText.replace(/\s+/g, " ").trim().substring(0, MAX_EXTRACTED_CHARS);
+    return { text: cleanText, error: cleanText.length < 40 ? "Kaum Text im PDF" : "" };
+  } catch (e) {
+    return { text: "", error: "OCR-Fehler" };
+  } finally {
+    deleteTempDriveFile(tempFileId);
+  }
+}
+
+function extractTextFromOfficeFile(file, isWord) {
+  if (typeof Drive === "undefined" || !Drive.Files) throw new Error("Drive-Dienst nicht aktiviert");
+
+  const targetMimeType = isWord ? "application/vnd.google-apps.document" : "application/vnd.google-apps.spreadsheet";
+  let tempFileId = null;
+
+  try {
+    tempFileId = createTempConvertedDriveFile(file.getBlob(), "Temp_Convert_" + file.getName(), targetMimeType, false);
+    if (!tempFileId) return "";
+
+    let extractedText = "";
+    if (isWord) {
+      extractedText = exportGoogleDocAsPlainText(tempFileId);
+    } else {
+      const sheet = SpreadsheetApp.openById(tempFileId);
+      const values = sheet.getDataRange().getDisplayValues();
+      const maxRows = Math.min(values.length, MAX_EXCEL_ROWS);
+      const lines = [];
+      for (let i = 0; i < maxRows; i++) lines.push(values[i].join(" | "));
+      extractedText = lines.join("\n");
+    }
+    return extractedText.replace(/\s+/g, " ").trim().substring(0, MAX_EXTRACTED_CHARS);
+  } finally {
+    deleteTempDriveFile(tempFileId);
+  }
+}
+
+function getPageOnePreviewImage(file) {
+  try {
+    const nativeThumb = file.getThumbnail();
+    if (nativeThumb && nativeThumb.getBytes().length > 1000) return nativeThumb;
+  } catch (e) {}
+
+  if (typeof Drive !== "undefined" && Drive.Files) {
+    try {
+      let meta;
+      try { meta = Drive.Files.get(file.getId(), { fields: "thumbnailLink" }); }
+      catch (v2Err) { meta = Drive.Files.get(file.getId()); }
+
+      if (meta && meta.thumbnailLink) {
+        const resizedUrl = meta.thumbnailLink.replace(/=s\d+.*$/, `=s${MAX_IMAGE_DIMENSION}`);
+        let res = UrlFetchApp.fetch(resizedUrl, { muteHttpExceptions: true });
+        if (res.getResponseCode() !== 200) {
+          res = UrlFetchApp.fetch(resizedUrl, {
+            headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
+            muteHttpExceptions: true
+          });
+        }
+        if (res.getResponseCode() === 200) {
+          const thumbBlob = res.getBlob();
+          if (thumbBlob.getContentType().startsWith("image/") && thumbBlob.getBytes().length > 1000) return thumbBlob;
+        }
+      }
+    } catch (e2) {}
+  }
+  return null;
+}
+
+
+// ==========================================
 // INTELLIGENTE ORDNER-VORFILTERUNG (MIT SCHUTZ FÜR NICHT-FINANZORDNER)
 // ==========================================
-function selectRelevantFolders(allowedFolders, fileName, extractedText) {
-  if (allowedFolders.length <= 80) {
+function selectRelevantFolders(allowedFolders, fileName, extractedText, boostedFolders = []) {
+  const maxTotal = typeof MAX_MATCHED_FOLDERS !== "undefined" ? MAX_MATCHED_FOLDERS : 75;
+  if (allowedFolders.length <= maxTotal) {
     return allowedFolders.map((path, idx) => ({ idx, path }));
   }
+
+  const boostedSet = new Set(Array.isArray(boostedFolders) ? boostedFolders : []);
+  const pinnedBoosts = [];
+  const seenIdx = new Set();
+
+  allowedFolders.forEach((path, idx) => {
+    if (boostedSet.has(path) && !seenIdx.has(idx)) {
+      seenIdx.add(idx);
+      pinnedBoosts.push({ idx, path });
+    }
+  });
 
   const stopWords = new Set([
     "der", "die", "das", "und", "für", "von", "mit", "ein", "eine", "einer", "eines", "einem", "einen",
@@ -682,8 +1008,11 @@ function selectRelevantFolders(allowedFolders, fileName, extractedText) {
     "ohne", "bis", "seit", "vor", "zwischen", "pdf", "jpg", "png", "docx", "xlsx", "dokument", "datei"
   ]);
 
-  const sourceText = `${fileName} ${extractedText || ""}`.toLowerCase();
-  const rawTokens = sourceText.match(/[a-zäöüß0-9]{3,}/g) || [];
+  const normSource = typeof normalizeRuleText === "function"
+    ? normalizeRuleText(`${fileName} ${extractedText || ""}`)
+    : `${fileName} ${extractedText || ""}`.toLowerCase();
+
+  const rawTokens = normSource.match(/[a-z0-9]{3,}/g) || [];
 
   const exactTokens = new Set();
   const stemTokens = new Set();
@@ -694,40 +1023,54 @@ function selectRelevantFolders(allowedFolders, fileName, extractedText) {
     if (tok.length >= 5) stemTokens.add(tok.substring(0, 5));
   });
 
-  const scored = allowedFolders.map((path, idx) => {
-    const cleanPath = path.replace(/\s*\/\s*/g, "/");
-    const depth = cleanPath.split("/").length;
-    const pathWords = cleanPath.toLowerCase().match(/[a-zäöüß0-9]{3,}/g) || [];
+  const scored = allowedFolders
+    .map((path, idx) => {
+      if (seenIdx.has(idx)) return null;
+      const cleanPath = path.replace(/\s*\/\s*/g, "/");
+      const depth = cleanPath.split("/").length;
+      const normPath = typeof normalizeRuleText === "function" ? normalizeRuleText(cleanPath) : cleanPath.toLowerCase();
+      const pathWords = normPath.match(/[a-z0-9]{3,}/g) || [];
 
-    let score = 0;
-    pathWords.forEach(pw => {
-      if (stopWords.has(pw)) return;
-      if (exactTokens.has(pw)) score += 3;
-      else if (pw.length >= 5 && stemTokens.has(pw.substring(0, 5))) score += 2;
-    });
+      let score = 0;
+      pathWords.forEach(pw => {
+        if (stopWords.has(pw)) return;
+        if (exactTokens.has(pw)) score += 3;
+        else if (pw.length >= 5 && stemTokens.has(pw.substring(0, 5))) score += 2;
+      });
 
-    return { idx, path, depth, score, isFinance: isFinanceFolderPath(path) };
-  });
+      return { idx, path, depth, score, isFinance: isFinanceFolderPath(path) };
+    })
+    .filter(Boolean);
+
+  const remainingBudget = Math.max(0, maxTotal - pinnedBoosts.length);
+  const nonFinanceBudget = Math.max(10, Math.floor(remainingBudget * 0.6));
+  const financeBudget = Math.max(5, Math.floor(remainingBudget * 0.25));
+  const fallbackBudget = Math.max(0, remainingBudget - nonFinanceBudget - financeBudget);
 
   // Getrennte Budgets, damit 01_Finanzen niemals Kunden-/Verwaltungsordner verdrängt
   const matchedNonFinance = scored
     .filter(item => !item.isFinance && item.score > 0)
     .sort((a, b) => b.score - a.score || a.depth - b.depth)
-    .slice(0, 45);
+    .slice(0, nonFinanceBudget);
 
   const matchedFinance = scored
     .filter(item => item.isFinance && item.score > 0)
     .sort((a, b) => b.score - a.score || a.depth - b.depth)
-    .slice(0, 30);
+    .slice(0, financeBudget);
 
-  const selectedIdxSet = new Set([...matchedNonFinance, ...matchedFinance].map(m => m.idx));
+  const pickedIdx = new Set([
+    ...pinnedBoosts.map(x => x.idx),
+    ...matchedNonFinance.map(x => x.idx),
+    ...matchedFinance.map(x => x.idx)
+  ]);
+
   const fallbackNonFinance = scored
-    .filter(item => !item.isFinance && !selectedIdxSet.has(item.idx))
-    .slice(0, 25);
+    .filter(item => !item.isFinance && !pickedIdx.has(item.idx))
+    .slice(0, fallbackBudget);
 
-  const combined = [...matchedNonFinance, ...matchedFinance, ...fallbackNonFinance];
+  const combined = [...pinnedBoosts, ...matchedNonFinance, ...matchedFinance, ...fallbackNonFinance];
   combined.sort((a, b) => a.idx - b.idx);
-  return combined.map(item => ({ idx: item.idx, path: item.path }));
+  return combined.slice(0, maxTotal).map(item => ({ idx: item.idx, path: item.path }));
 }
 
 
@@ -838,13 +1181,14 @@ function formatIndexedFolders(indexedFolderItems) {
     .join("\n");
 }
 
-function buildPrompt(file, indexedFolderItems, subFolderPath = "") {
+function buildPrompt(file, indexedFolderItems, subFolderPath = "", promptHint = "") {
   const fallbackDate = Utilities.formatDate(file.getDateCreated(), "Europe/Berlin", "yyyy-MM-dd");
   const compactList = formatIndexedFolders(indexedFolderItems);
   const subFolderHint = subFolderPath ? `, Inbox-Unterordner: "${subFolderPath}"` : "";
+  const ruleHintBlock = promptHint ? `\n${promptHint}\n` : "\n";
 
   let prompt = `Archiviere Dokument (Original: "${file.getName()}", Fallback-Datum: ${fallbackDate}${subFolderHint}).
-
+${ruleHintBlock}
 STRIKTE SORTIERREGEL FÜR "01_Finanzen" (UND ALLE UNTERORDNER VON "01_Finanzen"):
 - Ordner unter "01_Finanzen" (inklusive aller Unterordner!) sind AUSSCHLIESSLICH erlaubt für:
   1. Eindeutige RECHNUNGEN, QUITTUNGEN oder KASSENBONS (mit klarem Rechnungssteller, Empfänger und Rechnungs-Endbetrag > 0).
@@ -1032,4 +1376,15 @@ function executeGeminiCall(payload, allowedFolders, ss, stepInfo, fileName) {
     }
   }
   return { folder_name: "API-Fehler (" + lastErrorCode + ")", suggested_filename: "", reasoning: lastErrorMsg, tokens: 0, tokenDisplay: "0" };
+}
+
+function ensureFileExtension(originalName, newName) {
+  let sanitized = newName.replace(/[\/\\:*?"<>|]/g, "-").trim();
+  const lastDotIndex = originalName.lastIndexOf(".");
+  if (lastDotIndex > 0 && (originalName.length - lastDotIndex) <= 6) {
+    const ext = originalName.substring(lastDotIndex).toLowerCase();
+    sanitized = sanitized.replace(/\.(pdf|jpe?g|png|webp|heic|txt|csv|docx?|xlsx?)$/i, "");
+    return sanitized + ext;
+  }
+  return sanitized;
 }
