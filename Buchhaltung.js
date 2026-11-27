@@ -3,6 +3,7 @@
 // ==========================================
 const ACCOUNTING_YEAR = "2026";
 const MAX_ACCOUNTING_RUNTIME_MS = 280000; // Sicherheitsstopp bei ~4 Min. 40 Sek. (vor dem 6-Min.-Limit)
+const ACCOUNTING_FLUSH_EVERY_N_BOOKINGS = 5;
 
 const ACCOUNTING_CATEGORIES = [
   "Pflegeleistungen (§36 / §37 / §39 / §45b SGB XI)",
@@ -28,10 +29,11 @@ const ACCOUNTING_SOURCE_PREFIXES = [
 ];
 
 const ACCOUNTING_EXCLUDE_SUBSTRINGS = [
-  "Innaktive Kunden",
-  "Volks Bank",
-  "Honorarkalkulation",
-  "Infos zum Steuer"
+  "inaktive kunden",
+  "inaktive kunden",
+  "volks bank",
+  "honorarkalkulation",
+  "infos zum steuer"
 ];
 
 const MONTH_SHEET_NAMES = [
@@ -247,9 +249,22 @@ function parseAccountingAmount(val) {
   return isNaN(num) ? 0 : num;
 }
 
+function computeAccountingBusinessKey(invNr, amount, bDate) {
+  if (typeof buildInvoiceBusinessKey === "function") {
+    return buildInvoiceBusinessKey(invNr, amount, bDate);
+  }
+  const cleanInv = (invNr || "").toString().trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+  const numAmt = Number(amount) || 0;
+  if (!cleanInv || cleanInv.length < 3 || numAmt <= 0) return "";
+  const datePart = (bDate || "").toString().trim().substring(0, 10);
+  return `${cleanInv}|${numAmt.toFixed(2)}|${datePart}`;
+}
+
 function bookApprovedInvoice(ss, data) {
   const numAmount = parseAccountingAmount(data ? data.amount : 0);
-  if (!data || data.type === "Kein Beleg" || data.type === "" || numAmount <= 0) return;
+  if (!data || data.type === "Kein Beleg" || data.type === "" || numAmount <= 0) {
+    return { booked: false, reason: "Kein gültiger Rechnungsbetrag oder Belegtyp" };
+  }
 
   const journal = getOrCreateBuchungsjournal(ss);
   const cleanFileId = (data.fileId || "").toString().trim();
@@ -258,9 +273,7 @@ function bookApprovedInvoice(ss, data) {
   const isoDateStr = normalizeDateToIso(data.bDate) || Utilities.formatDate(new Date(), "Europe/Berlin", "yyyy-MM-dd");
   const isoDueStr = normalizeDateToIso(data.dueDate);
   const monthStr = isoDateStr.substring(0, 7);
-  const incomingBizKey = typeof buildInvoiceBusinessKey === "function"
-    ? buildInvoiceBusinessKey(cleanInvNr, numAmount, isoDateStr)
-    : "";
+  const incomingBizKey = computeAccountingBusinessKey(cleanInvNr, numAmount, isoDateStr);
   const normCleanInv = cleanInvNr.toLowerCase().replace(/[^a-z0-9]/g, "");
 
   if (journal.getLastRow() > 1) {
@@ -273,12 +286,14 @@ function bookApprovedInvoice(ss, data) {
       const existingAmount = parseAccountingAmount(jData[r][5]);
       const existingFileId = (jData[r][11] || "").toString().trim();
 
-      if (cleanFileId && existingFileId === cleanFileId) return;
+      if (cleanFileId && existingFileId === cleanFileId) {
+        return { booked: false, reason: "Duplikat (Datei-ID)" };
+      }
 
-      const existingBizKey = typeof buildInvoiceBusinessKey === "function"
-        ? buildInvoiceBusinessKey(existingInvNr, existingAmount, existingDate)
-        : "";
-      if (incomingBizKey && existingBizKey === incomingBizKey) return;
+      const existingBizKey = computeAccountingBusinessKey(existingInvNr, existingAmount, existingDate);
+      if (incomingBizKey && existingBizKey === incomingBizKey) {
+        return { booked: false, reason: `Duplikat (${incomingBizKey})` };
+      }
 
       const normExistingInv = existingInvNr.toLowerCase().replace(/[^a-z0-9]/g, "");
       if (
@@ -286,10 +301,12 @@ function bookApprovedInvoice(ss, data) {
         normExistingInv === normCleanInv &&
         Math.abs(existingAmount - numAmount) <= 0.02
       ) {
-        return;
+        return { booked: false, reason: "Duplikat (Rechnungs-Nr. + Betrag)" };
       }
 
-      if (cleanInvNr && cleanInvNr.length >= 4 && existingInvNr === cleanInvNr && existingPartner === cleanPartner) return;
+      if (cleanInvNr && cleanInvNr.length >= 4 && existingInvNr === cleanInvNr && existingPartner === cleanPartner) {
+        return { booked: false, reason: "Duplikat (Rechnungs-Nr. + Partner)" };
+      }
     }
   }
 
@@ -304,7 +321,22 @@ function bookApprovedInvoice(ss, data) {
 
   if (monthStr.startsWith(ACCOUNTING_YEAR + "-")) {
     writeEntryToMonthlySheet(ss, data, monthStr);
+    return { booked: true, skippedMonthlyYear: "" };
   }
+
+  return { booked: true, skippedMonthlyYear: monthStr };
+}
+
+function findLastPopulatedRowInRange(sheet, startRow, colCount) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < startRow) return startRow - 1;
+
+  const values = sheet.getRange(startRow, 1, lastRow - startRow + 1, colCount).getValues();
+  for (let i = values.length - 1; i >= 0; i--) {
+    const hasValue = values[i].some(cell => cell !== "" && cell !== null);
+    if (hasValue) return startRow + i;
+  }
+  return startRow - 1;
 }
 
 function writeEntryToMonthlySheet(ss, data, monthStr) {
@@ -328,18 +360,9 @@ function writeEntryToMonthlySheet(ss, data, monthStr) {
   if (data.category && !isIncome) descParts.push(`(${data.category})`);
   const description = descParts.filter(Boolean).join(" – ");
 
-  // Linke Tabelle (Spalten A-E): nächste freie Zeile suchen
-  const maxAvailableRows = Math.max(1, monthSheet.getMaxRows() - 3);
-  const scanLimit = Math.min(Math.max(monthSheet.getLastRow() - 3, 50), maxAvailableRows);
-  const leftValues = monthSheet.getRange(4, 1, scanLimit, 4).getValues();
-  let targetLeftRow = 4;
-  for (let i = 0; i < leftValues.length; i++) {
-    if (leftValues[i][0] === "" && leftValues[i][1] === "" && leftValues[i][2] === "" && leftValues[i][3] === "") {
-      targetLeftRow = i + 4;
-      break;
-    }
-    targetLeftRow = i + 5;
-  }
+  // Linke Tabelle (Spalten A-E): nach letzter belegter Zeile in A:D einfügen
+  const lastLeftRow = findLastPopulatedRowInRange(monthSheet, 4, 4);
+  const targetLeftRow = Math.max(4, lastLeftRow + 1);
 
   if (targetLeftRow > monthSheet.getMaxRows()) {
     monthSheet.insertRowsAfter(monthSheet.getMaxRows(), 10);
@@ -359,17 +382,10 @@ function writeEntryToMonthlySheet(ss, data, monthStr) {
     : `=E${targetLeftRow - 1}+B${targetLeftRow}-C${targetLeftRow}`;
   monthSheet.getRange(targetLeftRow, 5).setFormula(saldoFormula).setNumberFormat("#,##0.00 €");
 
-  // Rechte Tabelle (Spalten G-L) nur bei Einnahmen
+  // Rechte Tabelle (Spalten G-L): nach letzter belegter Zeile in G:L bei Einnahmen einfügen
   if (isIncome) {
-    const rightValues = monthSheet.getRange(4, 7, scanLimit, 4).getValues();
-    let targetRightRow = 4;
-    for (let i = 0; i < rightValues.length; i++) {
-      if (rightValues[i][0] === "" && rightValues[i][1] === "" && rightValues[i][3] === "") {
-        targetRightRow = i + 4;
-        break;
-      }
-      targetRightRow = i + 5;
-    }
+    const lastRightRow = findLastPopulatedRowInRange(monthSheet, 4, 12);
+    const targetRightRow = Math.max(4, lastRightRow + 1);
 
     if (targetRightRow > monthSheet.getMaxRows()) {
       monthSheet.insertRowsAfter(monthSheet.getMaxRows(), 10);
@@ -406,12 +422,61 @@ function parseIsoDate(dateStr) {
 // ==========================================
 // BESTANDS-SCANNER: EINZEL-VERARBEITUNG ALLER BELEGE
 // ==========================================
-function notifyAccountingProgress(ss, message, title = "📊 Buchhaltung", seconds = 5) {
+function notifyAccountingProgress(ss, message, title = "📊 Buchhaltung", seconds = 5, flushNow = false) {
   if (typeof updateLiveStatus === "function") {
-    updateLiveStatus(ss, message, title, seconds);
+    updateLiveStatus(ss, message, title, seconds, flushNow);
   } else if (ss) {
     ss.toast(message, title, seconds);
   }
+}
+
+function isExcludedAccountingPath(folderPath) {
+  const lowerPath = (folderPath || "").toString().toLowerCase();
+  return ACCOUNTING_EXCLUDE_SUBSTRINGS.some(ex => lowerPath.includes(ex.toLowerCase()));
+}
+
+function collectFinanceFoldersFast(seedFolders, targetFolders, seenFolderIds) {
+  const childrenMap = typeof fetchAllDriveFoldersMap === "function" ? fetchAllDriveFoldersMap() : null;
+  if (childrenMap && typeof traverseFolderMapInMemory === "function") {
+    const tempRegistry = new Map();
+    seedFolders.forEach(seed => {
+      try {
+        const folder = DriveApp.getFolderById(seed.id);
+        if (!folder.isTrashed() && !isExcludedAccountingPath(seed.path)) {
+          tempRegistry.set(seed.id, seed.path);
+          const directSubs = (childrenMap.get(seed.id) || []).filter(sub => {
+            const candidatePath = `${seed.path} / ${sub.name}`;
+            return !isExcludedAccountingPath(candidatePath);
+          });
+          directSubs.sort((a, b) => a.name.localeCompare(b.name, "de"));
+          directSubs.forEach(sub => {
+            const subRegistry = new Map();
+            traverseFolderMapInMemory(sub.id, `${seed.path} / ${sub.name}`, childrenMap, subRegistry);
+            subRegistry.forEach((p, id) => {
+              if (!isExcludedAccountingPath(p)) tempRegistry.set(id, p);
+            });
+          });
+        }
+      } catch (e) {}
+    });
+
+    tempRegistry.forEach((path, id) => {
+      if (!seenFolderIds.has(id) && !isExcludedAccountingPath(path)) {
+        seenFolderIds.add(id);
+        targetFolders.push({ path, id });
+      }
+    });
+    return;
+  }
+
+  seedFolders.forEach(seed => {
+    try {
+      const folder = DriveApp.getFolderById(seed.id);
+      if (!folder.isTrashed()) {
+        collectAccountingSubfoldersDirect(folder, seed.path, targetFolders, seenFolderIds);
+      }
+    } catch (e) {}
+  });
 }
 
 function scanExistingFoldersForAccounting() {
@@ -458,20 +523,13 @@ function scanExistingFoldersForAccounting() {
     if (!path || !id || id.length < 10) return;
 
     const matchesPrefix = ACCOUNTING_SOURCE_PREFIXES.some(prefix => path.startsWith(prefix));
-    const isExcluded = ACCOUNTING_EXCLUDE_SUBSTRINGS.some(ex => path.includes(ex));
+    const isExcluded = isExcludedAccountingPath(path);
     if (matchesPrefix && !isExcluded) {
       seedFolders.push({ path, id });
     }
   });
 
-  seedFolders.forEach(seed => {
-    try {
-      const folder = DriveApp.getFolderById(seed.id);
-      if (!folder.isTrashed()) {
-        collectAccountingSubfoldersDirect(folder, seed.path, targetFolders, seenFolderIds);
-      }
-    } catch (e) {}
-  });
+  collectFinanceFoldersFast(seedFolders, targetFolders, seenFolderIds);
 
   if (targetFolders.length === 0) {
     ss.toast("Keine Ordner unter '01_Finanzen' gefunden. Bitte zuerst '0. Ordner & Unterordner einlesen' ausführen.", "Hinweis", 6);
@@ -500,7 +558,7 @@ function scanExistingFoldersForAccounting() {
   }
 
   if (filesQueue.length === 0) {
-    notifyAccountingProgress(ss, "Alle Belege unter '01_Finanzen' wurden bereits ausgelesen!", "Alles aktuell ✓", 8);
+    notifyAccountingProgress(ss, "Alle Belege unter '01_Finanzen' wurden bereits ausgelesen!", "Alles aktuell ✓", 8, true);
     return;
   }
 
@@ -512,6 +570,7 @@ function scanExistingFoldersForAccounting() {
   }
 
   let bookedCount = 0;
+  let outOfYearCount = 0;
   let skippedNonInvoices = 0;
   let errorCount = 0;
   let totalTokensRun = 0;
@@ -526,7 +585,8 @@ function scanExistingFoldersForAccounting() {
         ss,
         `Zeitlimit (4 Min. 40 Sek.) erreicht. ${filesQueue.length - processedCount} Datei(en) verbleiben für den nächsten Lauf.`,
         "⏱️ Sicherheitspause",
-        8
+        8,
+        true
       );
       break;
     }
@@ -553,7 +613,7 @@ function scanExistingFoldersForAccounting() {
     if (!res || res.getResponseCode() !== 200) {
       errorCount++;
       processedCount++;
-      notifyAccountingProgress(ss, `[3/3] API-Fehler bei "${fileName}" – wird beim nächsten Lauf erneut geprüft.`, stepPrefix, 5);
+      notifyAccountingProgress(ss, `[3/3] API-Fehler bei "${fileName}" – wird beim nächsten Lauf erneut geprüft.`, stepPrefix, 5, true);
       continue;
     }
 
@@ -588,7 +648,7 @@ function scanExistingFoldersForAccounting() {
     if (extracted.t && extracted.t !== "Kein Beleg" && invAmount > 0) {
       const fallbackDate = Utilities.formatDate(file.getDateCreated(), "Europe/Berlin", "yyyy-MM-dd");
       const linkFormula = `=HYPERLINK("${file.getUrl()}"; "${fileName.replace(/"/g, '""')}")`;
-      bookApprovedInvoice(ss, {
+      const bookingRes = bookApprovedInvoice(ss, {
         link: linkFormula,
         type: extracted.t,
         bDate: extracted.d || fallbackDate,
@@ -602,14 +662,32 @@ function scanExistingFoldersForAccounting() {
         fileId: fileId,
         tokens: tokenDisplay
       });
-      SpreadsheetApp.flush();
-      bookedCount++;
-      notifyAccountingProgress(
-        ss,
-        `[3/3] Verbucht: ${extracted.t} | ${extracted.p || fileName} | ${invAmount.toFixed(2)} € (${tokenDisplay})`,
-        stepPrefix,
-        5
-      );
+
+      if (bookingRes && bookingRes.booked) {
+        bookedCount++;
+        if (bookingRes.skippedMonthlyYear) outOfYearCount++;
+        const shouldFlush = (bookedCount % ACCOUNTING_FLUSH_EVERY_N_BOOKINGS === 0);
+        if (shouldFlush) SpreadsheetApp.flush();
+
+        const yearNote = bookingRes.skippedMonthlyYear
+          ? ` [Nur Journal, Zeitraum ${bookingRes.skippedMonthlyYear} ≠ ${ACCOUNTING_YEAR}]`
+          : "";
+        notifyAccountingProgress(
+          ss,
+          `[3/3] Verbucht: ${extracted.t} | ${extracted.p || fileName} | ${invAmount.toFixed(2)} € (${tokenDisplay})${yearNote}`,
+          stepPrefix,
+          5,
+          shouldFlush
+        );
+      } else {
+        skippedNonInvoices++;
+        notifyAccountingProgress(
+          ss,
+          `[3/3] Übersprungen (${bookingRes ? bookingRes.reason : "Duplikat"}): "${fileName}"`,
+          stepPrefix,
+          4
+        );
+      }
     } else {
       skippedNonInvoices++;
       notifyAccountingProgress(
@@ -627,6 +705,8 @@ function scanExistingFoldersForAccounting() {
     }
   }
 
+  SpreadsheetApp.flush();
+
   // Fortschritt sicher in Properties puffern (max. 150 IDs, um 9-KB-Limit nicht zu verletzen)
   try {
     const safeRecentIds = [...scannedIds].slice(-150);
@@ -634,19 +714,21 @@ function scanExistingFoldersForAccounting() {
   } catch (propErr) {}
 
   const elapsedSec = ((Date.now() - startTime) / 1000).toFixed(1);
+  const yearInfo = outOfYearCount > 0 ? ` | 📅 ${outOfYearCount} nicht in Monatsblättern ${ACCOUNTING_YEAR}` : "";
   const errInfo = errorCount > 0 ? ` | ❌ ${errorCount} Fehler` : "";
   const remInfo = stoppedByTimeout ? ` | ⏱️ ${filesQueue.length - processedCount} verbleibend` : "";
 
   notifyAccountingProgress(
     ss,
-    `Fertig in ${elapsedSec}s: ${bookedCount} Beleg(e) gebucht, ${skippedNonInvoices} übersprungen (${totalTokensRun} Tokens)${errInfo}${remInfo}`,
+    `Fertig in ${elapsedSec}s: ${bookedCount} Beleg(e) gebucht, ${skippedNonInvoices} übersprungen (${totalTokensRun} Tokens)${yearInfo}${errInfo}${remInfo}`,
     "✅ Bestands-Scan abgeschlossen",
-    10
+    10,
+    true
   );
 }
 
 function collectAccountingSubfoldersDirect(folder, currentPath, targetList, seenIds) {
-  if (ACCOUNTING_EXCLUDE_SUBSTRINGS.some(ex => currentPath.includes(ex))) return;
+  if (isExcludedAccountingPath(currentPath)) return;
   if (!seenIds.has(folder.getId())) {
     seenIds.add(folder.getId());
     targetList.push({ path: currentPath, id: folder.getId() });
@@ -724,15 +806,16 @@ function sendAccountingRequest(basePayload, models, apiKey, ss, stepInfo, fileNa
 
 function buildAccountingPayloadForFile(file, folderPath) {
   const lowerName = file.getName().toLowerCase();
+  const lowerPath = (folderPath || "").toLowerCase();
   const driveMime = (file.getMimeType() || "").toLowerCase();
   const blobMime = (file.getBlob().getContentType() || "").toLowerCase();
   const fallbackDate = Utilities.formatDate(file.getDateCreated(), "Europe/Berlin", "yyyy-MM-dd");
 
   let folderHint = "Hinweis aus Ordnerpfad: Bestimme Einnahme oder Ausgabe anhand des Dokumentinhalts.";
-  if (folderPath.includes("Belege Ausgabe") || folderPath.toLowerCase().includes("ausgabe")) {
-    folderHint = "Hinweis aus Ordnerpfad: Dies liegt im AUSGABEN-Ordner.";
-  } else if (folderPath.toLowerCase().includes("kunde") || folderPath.toLowerCase().includes("einnahme") || folderPath.toLowerCase().includes("abrechnung")) {
-    folderHint = "Hinweis aus Ordnerpfad: Dies liegt im KUNDEN-ABRECHNUNGS-Ordner (Einnahme, sofern Rechnung/Abrechnung).";
+  if (lowerPath.includes("03_eingangsrechnungen") || lowerPath.includes("belege ausgabe") || lowerPath.includes("ausgabe")) {
+    folderHint = "Hinweis aus Ordnerpfad: Dies liegt im AUSGABEN-/EINGANGSRECHNUNGS-Ordner.";
+  } else if (lowerPath.includes("02_ausgangsrechnungen") || lowerPath.includes("kunde") || lowerPath.includes("einnahme") || lowerPath.includes("abrechnung")) {
+    folderHint = "Hinweis aus Ordnerpfad: Dies liegt im KUNDEN-/AUSGANGSRECHNUNGS-Ordner (Einnahme, sofern Rechnung/Abrechnung).";
   }
 
   const basePrompt = `Extrahiere Buchhaltungsdaten aus diesem Dokument.
@@ -830,8 +913,10 @@ function syncJournalToMonthlySheets() {
   const fileIdIndex = headers.indexOf("Datei-ID");
 
   const rows = journal.getRange(2, 1, journal.getLastRow() - 1, Math.max(12, journal.getLastColumn())).getValues();
+  let syncedCount = 0;
+  let skippedYearCount = 0;
+
   rows.forEach(r => {
-    // Date-Objekte aus Google Sheets wieder in "yyyy-MM" umwandeln
     let monthStr = "";
     if (r[0] instanceof Date && !isNaN(r[0].getTime())) {
       monthStr = Utilities.formatDate(r[0], "Europe/Berlin", "yyyy-MM");
@@ -843,7 +928,10 @@ function syncJournalToMonthlySheets() {
       if (parsedBDate) monthStr = parsedBDate.substring(0, 7);
     }
 
-    if (!monthStr.startsWith(ACCOUNTING_YEAR + "-")) return;
+    if (!monthStr.startsWith(ACCOUNTING_YEAR + "-")) {
+      skippedYearCount++;
+      return;
+    }
 
     writeEntryToMonthlySheet(ss, {
       bDate: r[1],
@@ -858,9 +946,11 @@ function syncJournalToMonthlySheets() {
       dueDate: dueIndex > -1 ? r[dueIndex] : "",
       fileId: fileIdIndex > -1 ? r[fileIdIndex] : ""
     }, monthStr);
+    syncedCount++;
   });
 
-  ss.toast(`${rows.length} Buchung(en) aus dem Journal in die Monatsblätter übertragen.`, "Synchronisation fertig ✓", 6);
+  const extraNote = skippedYearCount > 0 ? ` (${skippedYearCount} außerhalb ${ACCOUNTING_YEAR})` : "";
+  ss.toast(`${syncedCount} Buchung(en) aus dem Journal in die Monatsblätter übertragen${extraNote}.`, "Synchronisation fertig ✓", 6);
 }
 
 function resetAccountingScanLog() {
